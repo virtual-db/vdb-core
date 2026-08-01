@@ -161,13 +161,15 @@ func (h *Handlers) TruncateApply(ctx any, p any) (any, any, error) {
 	return ctx, payload, nil
 }
 
-// RecordsOverlay applies delta overlays to source records.
+// RecordsOverlay applies delta overlays to source records as a streaming
+// iterator. Source records are never materialised — they flow through the
+// overlay iterator and are eligible for GC as soon as the iterator advances.
 //
 // When no transaction is open the source records are overlaid with the shared
-// live delta — the existing behaviour.
+// live delta (committed state, visible to all).
 //
 // When the connection has an open transaction a second overlay pass is applied
-// on top: the connection's private TxDelta is merged over the result of the
+// on top: the connection's private TxDelta is layered over the result of the
 // first pass. This gives the writing connection read-your-own-writes
 // visibility into its uncommitted changes while keeping those changes
 // completely invisible to every other connection.
@@ -177,8 +179,8 @@ func (h *Handlers) RecordsOverlay(ctx any, p any) (any, any, error) {
 		return ctx, nil, fmt.Errorf("records.source.transform: %w", err)
 	}
 
-	// Pass 1: apply the shared live delta (committed state, visible to all).
-	merged, err := Overlay(h.delta, h.schema, payload.Table, payload.Records)
+	// Pass 1: apply the shared live delta as a streaming overlay.
+	iter, err := NewOverlayIter(h.delta, h.schema, payload.Table, payload.Records)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("records.source.transform: live delta overlay failed for table %q: %w", payload.Table, err)
 	}
@@ -187,13 +189,13 @@ func (h *Handlers) RecordsOverlay(ctx any, p any) (any, any, error) {
 	// staging delta on top so it can read its own uncommitted writes.
 	if payload.ConnectionID != 0 {
 		if state, found := h.conns.Get(payload.ConnectionID); found && state.TxDelta != nil {
-			merged, err = Overlay(state.TxDelta, h.schema, payload.Table, merged)
+			iter, err = NewOverlayIter(state.TxDelta, h.schema, payload.Table, iter)
 			if err != nil {
 				return ctx, nil, fmt.Errorf("records.source.transform: tx delta overlay failed for table %q: %w", payload.Table, err)
 			}
 		}
 	}
 
-	payload.Records = merged
+	payload.Records = iter
 	return ctx, payload, nil
 }

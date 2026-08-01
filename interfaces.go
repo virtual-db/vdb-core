@@ -9,6 +9,8 @@
 // and github.com/AnqorDX/dispatch, imported only by internal/framework.
 package core
 
+import "github.com/virtual-db/vdb-core/types"
+
 // PointFunc is the handler type for all pipeline point handlers.
 //
 //	func(ctx any, payload any) (any, any, error)
@@ -47,7 +49,10 @@ type DriverAPI interface {
 	TransactionRolledBack(connID uint32, savepoint string)
 	QueryReceived(connID uint32, query, database string) (string, error)
 	QueryCompleted(connID uint32, query string, rowsAffected int64, err error)
-	RecordsSource(connID uint32, table string, records []map[string]any) ([]map[string]any, error)
+	// RecordsSource receives a streaming iterator over source rows and returns
+	// a streaming iterator over the merged result after delta overlay. Callers
+	// must close both the input and output iterators.
+	RecordsSource(connID uint32, table string, records types.RecordIter) (types.RecordIter, error)
 	RecordsMerged(connID uint32, table string, records []map[string]any) ([]map[string]any, error)
 	RecordInserted(connID uint32, table string, record map[string]any) (map[string]any, error)
 	RecordUpdated(connID uint32, table string, old, new map[string]any) (map[string]any, error)

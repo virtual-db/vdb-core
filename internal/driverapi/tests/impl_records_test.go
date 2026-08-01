@@ -2,6 +2,7 @@ package driverapi_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	. "github.com/virtual-db/vdb-core/internal/driverapi"
@@ -22,20 +23,29 @@ func TestRecordsSource_HandlerCanModifyRecords(t *testing.T) {
 	pipe.DeclarePipeline(points.PipelineRecordsSource, []string{points.PointRecordsSourceTransform})
 	pipe.MustAttach(points.PointRecordsSourceTransform, 10, func(ctx any, p any) (any, any, error) {
 		modified := payloads.RecordsSourcePayload{
-			Records: []map[string]any{{"id": 42}},
+			Records: &sliceRecordIter{records: []map[string]any{{"id": 42}}},
 		}
 		return ctx, modified, nil
 	})
 
-	got, err := impl.RecordsSource(1, "t", nil)
+	got, err := impl.RecordsSource(1, "t", &sliceRecordIter{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 record, got %d", len(got))
+	// Consume the streaming iterator.
+	var records []map[string]any
+	for {
+		rec, err := got.Next()
+		if err != nil {
+			break
+		}
+		records = append(records, rec)
 	}
-	if got[0]["id"] != 42 {
-		t.Fatalf("expected record id 42, got %v", got[0]["id"])
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0]["id"] != 42 {
+		t.Fatalf("expected record id 42, got %v", records[0]["id"])
 	}
 }
 
@@ -47,7 +57,7 @@ func TestRecordsSource_HandlerError_IsReturned(t *testing.T) {
 		return ctx, p, errors.New("injected records source error")
 	})
 
-	got, err := impl.RecordsSource(1, "t", nil)
+	got, err := impl.RecordsSource(1, "t", &sliceRecordIter{})
 	if err == nil {
 		t.Fatal("expected non-nil error from handler, got nil")
 	}
@@ -88,3 +98,20 @@ func TestRecordsMerged_HandlerError_ReturnsOriginalRecords(t *testing.T) {
 		t.Fatalf("expected record id %v, got %v", original[0]["id"], got[0]["id"])
 	}
 }
+
+// sliceRecordIter is a test helper that adapts a slice to payloads.RecordIter.
+type sliceRecordIter struct {
+	records []map[string]any
+	idx     int
+}
+
+func (it *sliceRecordIter) Next() (map[string]any, error) {
+	if it.idx >= len(it.records) {
+		return nil, fmt.Errorf("EOF")
+	}
+	rec := it.records[it.idx]
+	it.idx++
+	return rec, nil
+}
+
+func (it *sliceRecordIter) Close() error { return nil }

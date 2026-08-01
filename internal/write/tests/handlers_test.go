@@ -1,6 +1,7 @@
 package write_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/virtual-db/vdb-core/internal/connection"
@@ -126,7 +127,7 @@ func TestHandlers_RecordsSource_AppliesOverlay(t *testing.T) {
 
 	result, err := pipe.Process(points.PipelineRecordsSource, payloads.RecordsSourcePayload{
 		Table:   "items",
-		Records: []map[string]any{},
+		Records: &sliceRecordIter{},
 	})
 	if err != nil {
 		t.Fatalf("Process(RecordsSource): %v", err)
@@ -136,10 +137,19 @@ func TestHandlers_RecordsSource_AppliesOverlay(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected result to be RecordsSourcePayload, got %T", result)
 	}
-	if got := len(p.Records); got != 1 {
+	// Consume the streaming overlay iterator.
+	var records []map[string]any
+	for {
+		rec, err := p.Records.Next()
+		if err != nil {
+			break
+		}
+		records = append(records, rec)
+	}
+	if got := len(records); got != 1 {
 		t.Fatalf("expected 1 record in overlay result, got %d", got)
 	}
-	if got := p.Records[0]["id"]; got != 99 {
+	if got := records[0]["id"]; got != 99 {
 		t.Errorf("expected inserted record id=99, got %v", got)
 	}
 }
@@ -177,3 +187,20 @@ func TestHandlers_Register_ReturnsNilError(t *testing.T) {
 		t.Fatalf("expected Register to return nil error, got: %v", err)
 	}
 }
+
+// sliceRecordIter is a test helper that adapts a slice to payloads.RecordIter.
+type sliceRecordIter struct {
+	records []map[string]any
+	idx     int
+}
+
+func (it *sliceRecordIter) Next() (map[string]any, error) {
+	if it.idx >= len(it.records) {
+		return nil, fmt.Errorf("EOF")
+	}
+	rec := it.records[it.idx]
+	it.idx++
+	return rec, nil
+}
+
+func (it *sliceRecordIter) Close() error { return nil }

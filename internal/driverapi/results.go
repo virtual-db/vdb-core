@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/virtual-db/vdb-core/internal/payloads"
+	"github.com/virtual-db/vdb-core/types"
 )
 
 func validateQueryResult(v any) (string, error) {
@@ -21,12 +22,14 @@ func validateQueryResult(v any) (string, error) {
 	}
 }
 
-func validateRecordsSourceResult(v any) ([]map[string]any, error) {
+func validateRecordsSourceResult(v any) (types.RecordIter, error) {
 	switch t := v.(type) {
+	case types.RecordIter:
+		return t, nil
 	case payloads.RecordsSourcePayload:
 		return t.Records, nil
 	case map[string]any:
-		return extractRecordSlice(t, "Records")
+		return extractRecordIter(t, "Records")
 	default:
 		return nil, fmt.Errorf("driverapi: records.source result has unrecognised type %T", v)
 	}
@@ -99,3 +102,46 @@ func extractRecordSlice(m map[string]any, field string) ([]map[string]any, error
 		return nil, fmt.Errorf("result map field %q is not a record slice (got %T)", field, v)
 	}
 }
+
+func extractRecordIter(m map[string]any, field string) (types.RecordIter, error) {
+	v, ok := m[field]
+	if !ok {
+		return nil, fmt.Errorf("result map missing field %q", field)
+	}
+	switch t := v.(type) {
+	case types.RecordIter:
+		return t, nil
+	case []map[string]any:
+		return &sliceRecordIter{records: t, idx: 0}, nil
+	case []any:
+		out := make([]map[string]any, len(t))
+		for i, item := range t {
+			rec, ok := item.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("result map field %q element %d is not a record (got %T)", field, i, item)
+			}
+			out[i] = rec
+		}
+		return &sliceRecordIter{records: out, idx: 0}, nil
+	default:
+		return nil, fmt.Errorf("result map field %q is not a record iter (got %T)", field, v)
+	}
+}
+
+// sliceRecordIter adapts a []map[string]any slice to RecordIter for backward
+// compatibility with plugins that return materialised slices.
+type sliceRecordIter struct {
+	records []map[string]any
+	idx     int
+}
+
+func (it *sliceRecordIter) Next() (map[string]any, error) {
+	if it.idx >= len(it.records) {
+		return nil, fmt.Errorf("EOF")
+	}
+	rec := it.records[it.idx]
+	it.idx++
+	return rec, nil
+}
+
+func (it *sliceRecordIter) Close() error { return nil }

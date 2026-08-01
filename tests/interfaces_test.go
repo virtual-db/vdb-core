@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	core "github.com/virtual-db/vdb-core"
+	"github.com/virtual-db/vdb-core/types"
 )
 
 // ---- Stub types for compile-time interface satisfaction checks ----
@@ -26,7 +27,7 @@ func (n *noopDriverAPI) TransactionCommitted(_ uint32) error                    
 func (n *noopDriverAPI) TransactionRolledBack(_ uint32, _ string)                {}
 func (n *noopDriverAPI) QueryReceived(_ uint32, query, _ string) (string, error) { return query, nil }
 func (n *noopDriverAPI) QueryCompleted(_ uint32, _ string, _ int64, _ error)     {}
-func (n *noopDriverAPI) RecordsSource(_ uint32, _ string, recs []map[string]any) ([]map[string]any, error) {
+func (n *noopDriverAPI) RecordsSource(_ uint32, _ string, recs types.RecordIter) (types.RecordIter, error) {
 	return recs, nil
 }
 func (n *noopDriverAPI) RecordsMerged(_ uint32, _ string, recs []map[string]any) ([]map[string]any, error) {

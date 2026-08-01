@@ -8,6 +8,7 @@ import (
 	"github.com/virtual-db/vdb-core/internal/payloads"
 	"github.com/virtual-db/vdb-core/internal/points"
 	"github.com/virtual-db/vdb-core/internal/schema"
+	"github.com/virtual-db/vdb-core/types"
 )
 
 // Impl is the framework's concrete implementation of core.DriverAPI.
@@ -109,7 +110,7 @@ func (d *Impl) QueryCompleted(connID uint32, query string, rowsAffected int64, e
 	d.bus.Emit(points.EventQueryCompleted, payload)
 }
 
-func (d *Impl) RecordsSource(connID uint32, table string, records []map[string]any) ([]map[string]any, error) {
+func (d *Impl) RecordsSource(connID uint32, table string, records types.RecordIter) (types.RecordIter, error) {
 	payload := payloads.RecordsSourcePayload{
 		ConnectionID: connID,
 		Table:        table,
