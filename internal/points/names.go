@@ -203,4 +203,10 @@ const (
 	EventSchemaLoaded          = "vdb.schema.loaded"
 	EventSchemaInvalidated     = "vdb.schema.invalidated"
 	EventTableTruncated        = "vdb.table.truncated"
+
+	// Events added for the MySQL engine (implementation plan doc 06 §5.1).
+	EventSourceRequested = "vdb.source.requested"
+	EventLimitReached    = "vdb.limit.reached"
+	EventSnapshotExpired = "vdb.snapshot.expired"
+	EventKeyConflict     = "vdb.key.conflict"
 )

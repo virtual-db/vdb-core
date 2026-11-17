@@ -3,6 +3,7 @@
 package emit_test
 
 import (
+	"github.com/virtual-db/vdb-core/internal/types"
 	"sync"
 	"testing"
 	"time"
@@ -310,8 +311,8 @@ func TestHandlers_WriteInsert_EmitsEvent(t *testing.T) {
 
 	wg.Add(1)
 	if _, err := pipe.Process(points.PipelineWriteInsert, payloads.WriteInsertPayload{
-		Table:  "users",
-		Record: map[string]any{"id": 1},
+		Table: "users",
+		Rows:  []types.Row{{{B: []byte("1")}}},
 	}); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
@@ -345,9 +346,8 @@ func TestHandlers_WriteUpdate_EmitsEvent(t *testing.T) {
 
 	wg.Add(1)
 	if _, err := pipe.Process(points.PipelineWriteUpdate, payloads.WriteUpdatePayload{
-		Table:     "users",
-		OldRecord: map[string]any{"id": 1},
-		NewRecord: map[string]any{"id": 1, "name": "b"},
+		Table: "users",
+		New:   types.Row{{B: []byte("1")}, {B: []byte("b")}},
 	}); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
@@ -381,8 +381,8 @@ func TestHandlers_WriteDelete_EmitsEvent(t *testing.T) {
 
 	wg.Add(1)
 	if _, err := pipe.Process(points.PipelineWriteDelete, payloads.WriteDeletePayload{
-		Table:  "users",
-		Record: map[string]any{"id": 1},
+		Table: "users",
+		Old:   types.RowRef{SourceKey: []byte("1")},
 	}); err != nil {
 		t.Fatalf("Process: %v", err)
 	}

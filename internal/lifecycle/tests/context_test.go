@@ -8,6 +8,7 @@
 package lifecycle_test
 
 import (
+	"github.com/virtual-db/vdb-core/internal/types"
 	"testing"
 
 	"github.com/virtual-db/vdb-core/internal/framework"
@@ -138,3 +139,5 @@ func TestContextCreate_ContributeHandlerCanAddValues(t *testing.T) {
 		t.Errorf(`app.global.Get("key") = %q, want "val"`, got)
 	}
 }
+
+func (s *stubApp) Restore(_ *types.ChangeSet) error { return nil }

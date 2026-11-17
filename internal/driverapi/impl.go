@@ -1,204 +1,140 @@
+// Package driverapi implements types.DriverAPI (implementation plan doc 03
+// §4): sessions, the catalog, client connections and statements, status.
+// Write and transaction calls run their pipelines; reads call merge directly
+// and run vdb.records.source and vdb.records.merged once per batch.
 package driverapi
 
 import (
-	"log"
+	"fmt"
 
-	"github.com/virtual-db/vdb-core/internal/connection"
+	"github.com/virtual-db/vdb-core/internal/catalog"
+	"github.com/virtual-db/vdb-core/internal/delta"
 	"github.com/virtual-db/vdb-core/internal/framework"
+	"github.com/virtual-db/vdb-core/internal/memory"
 	"github.com/virtual-db/vdb-core/internal/payloads"
 	"github.com/virtual-db/vdb-core/internal/points"
-	"github.com/virtual-db/vdb-core/internal/schema"
+	"github.com/virtual-db/vdb-core/internal/session"
+	"github.com/virtual-db/vdb-core/internal/txn"
+	"github.com/virtual-db/vdb-core/internal/types"
 )
 
-// Impl is the framework's concrete implementation of core.DriverAPI.
-// It dispatches each driver callback to the appropriate pipeline or event.
+// Pipelines is what the implementation needs from the framework.
+type Pipelines interface {
+	Process(pipeline string, payload any) (any, error)
+	HasHandlers(point string) bool
+	Emit(event string, payload any)
+	Transforms() []string
+}
+
+// Impl implements types.DriverAPI.
 type Impl struct {
-	pipe   *framework.Pipeline
-	bus    *framework.Bus
-	conns  *connection.State
-	schema *schema.Cache
+	p        Pipelines
+	sessions *session.Registry
+	txn      *txn.Manager
+	catalog  *catalog.Catalog
+	mem      *memory.Guard
 }
 
-// New constructs an Impl with the four framework subsystems it needs.
-func New(
-	pipe *framework.Pipeline,
-	bus *framework.Bus,
-	conns *connection.State,
-	schema *schema.Cache,
-) *Impl {
-	return &Impl{pipe: pipe, bus: bus, conns: conns, schema: schema}
+var _ types.DriverAPI = (*Impl)(nil)
+
+// New returns an Impl.
+func New(p Pipelines, sessions *session.Registry, m *txn.Manager, cat *catalog.Catalog, mem *memory.Guard) *Impl {
+	return &Impl{p: p, sessions: sessions, txn: m, catalog: cat, mem: mem}
 }
 
-func (d *Impl) ConnectionOpened(id uint32, user, addr string) error {
-	payload := payloads.ConnectionOpenedPayload{
-		ConnectionID: id,
-		User:         user,
-		Address:      addr,
-	}
-	_, err := d.pipe.Process(points.PipelineConnectionOpened, payload)
-	return err
+// OpenSession opens a session for a mysqld connection.
+func (a *Impl) OpenSession(info types.SessionInfo) (types.Session, error) {
+	return a.sessions.Open(info), nil
 }
 
-func (d *Impl) ConnectionClosed(id uint32, user, addr string) {
-	payload := payloads.ConnectionClosedPayload{
-		ConnectionID: id,
-		User:         user,
-		Address:      addr,
-	}
-	if _, err := d.pipe.Process(points.PipelineConnectionClosed, payload); err != nil {
-		log.Printf("driverapi: ConnectionClosed pipeline error for conn %d: %v", id, err)
-	}
-}
+// Kill ends any lock wait of the connection and marks its session killed.
+func (a *Impl) Kill(connID uint64) { a.sessions.Kill(connID) }
 
-func (d *Impl) TransactionBegun(connID uint32, readOnly bool) error {
-	payload := payloads.TransactionBeginPayload{
-		ConnectionID: connID,
-		ReadOnly:     readOnly,
-	}
-	_, err := d.pipe.Process(points.PipelineTransactionBegin, payload)
-	return err
-}
+// Catalog returns the catalog of record.
+func (a *Impl) Catalog() types.Catalog { return a.catalog }
 
-func (d *Impl) TransactionCommitted(connID uint32) error {
-	payload := payloads.TransactionCommitPayload{
-		ConnectionID: connID,
-	}
-	_, err := d.pipe.Process(points.PipelineTransactionCommit, payload)
-	return err
-}
-
-func (d *Impl) TransactionRolledBack(connID uint32, savepoint string) {
-	payload := payloads.TransactionRollbackPayload{
-		ConnectionID: connID,
-		Savepoint:    savepoint,
-	}
-	if _, err := d.pipe.Process(points.PipelineTransactionRollback, payload); err != nil {
-		log.Printf("driverapi: TransactionRolledBack pipeline error for conn %d: %v", connID, err)
-	}
-}
-
-func (d *Impl) QueryReceived(connID uint32, query, database string) (string, error) {
-	payload := payloads.QueryReceivedPayload{
-		ConnectionID: connID,
-		Query:        query,
-		Database:     database,
-	}
-	result, err := d.pipe.Process(points.PipelineQueryReceived, payload)
+// ConnectionOpened runs vdb.connection.opened.
+func (a *Impl) ConnectionOpened(connID uint64, account, addr string) error {
+	_, err := a.p.Process(points.PipelineConnectionOpened, payloads.ConnectionOpenedPayload{ConnectionID: connID, User: account, Address: addr})
 	if err != nil {
-		return "", err
+		return fmt.Errorf("driverapi.connection_opened: %w", err)
 	}
-	return validateQueryResult(result)
+	return nil
 }
 
-func (d *Impl) QueryCompleted(connID uint32, query string, rowsAffected int64, execErr error) {
-	errStr := ""
-	if execErr != nil {
-		errStr = execErr.Error()
-	}
-
-	database := d.conns.GetDatabase(connID)
-
-	payload := payloads.QueryCompletedPayload{
-		ConnectionID: connID,
-		Query:        query,
-		Database:     database,
-		DurationMs:   0,
-		RowsAffected: rowsAffected,
-		Error:        errStr,
-	}
-	d.bus.Emit(points.EventQueryCompleted, payload)
+// ConnectionClosed runs vdb.connection.closed.
+func (a *Impl) ConnectionClosed(connID uint64, account, addr string) {
+	_, _ = a.p.Process(points.PipelineConnectionClosed, payloads.ConnectionClosedPayload{ConnectionID: connID, User: account, Address: addr})
 }
 
-func (d *Impl) RecordsSource(connID uint32, table string, records []map[string]any) ([]map[string]any, error) {
-	payload := payloads.RecordsSourcePayload{
-		ConnectionID: connID,
-		Table:        table,
-		Records:      records,
-	}
-	result, err := d.pipe.Process(points.PipelineRecordsSource, payload)
+// QueryReceived runs vdb.query.received and returns the possibly rewritten statement.
+func (a *Impl) QueryReceived(connID uint64, query, database string) (string, error) {
+	out, err := a.p.Process(points.PipelineQueryReceived, payloads.QueryReceivedPayload{ConnectionID: connID, Query: query, Database: database})
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("driverapi.query_received: %w", err)
 	}
-	return validateRecordsSourceResult(result)
-}
-
-func (d *Impl) RecordsMerged(connID uint32, table string, records []map[string]any) ([]map[string]any, error) {
-	payload := payloads.RecordsMergedPayload{
-		ConnectionID: connID,
-		Table:        table,
-		Records:      records,
-	}
-	result, err := d.pipe.Process(points.PipelineRecordsMerged, payload)
+	pl, err := payloads.Decode[payloads.QueryReceivedPayload](out)
 	if err != nil {
-		log.Printf("driverapi: RecordsMerged pipeline error for conn %d table %q: %v", connID, table, err)
-		return records, nil
+		return query, nil
 	}
-	out, err := validateRecordsMergedResult(result)
-	if err != nil {
-		log.Printf("driverapi: RecordsMerged result validation error for conn %d table %q: %v", connID, table, err)
-		return records, nil
-	}
-	return out, nil
+	return pl.Query, nil
 }
 
-func (d *Impl) RecordInserted(connID uint32, table string, record map[string]any) (map[string]any, error) {
-	payload := payloads.WriteInsertPayload{
-		ConnectionID: connID,
-		Table:        table,
-		Record:       record,
-	}
-	result, err := d.pipe.Process(points.PipelineWriteInsert, payload)
-	if err != nil {
-		return nil, err
-	}
-	return validateWriteInsertResult(result)
+// QueryCompleted emits vdb.query.completed.
+func (a *Impl) QueryCompleted(connID uint64, q types.QueryInfo) {
+	a.p.Emit(points.EventQueryCompleted, payloads.QueryCompletedPayload{
+		ConnectionID: connID, Query: q.Query, Digest: q.Digest, Database: q.Database, Account: q.Account,
+		DurationMs: float64(q.Duration.Microseconds()) / 1000, RowsAffected: q.RowsAffected, RowsSent: q.RowsSent, ErrorCode: q.ErrorCode})
 }
 
-func (d *Impl) RecordUpdated(connID uint32, table string, old, new map[string]any) (map[string]any, error) {
-	payload := payloads.WriteUpdatePayload{
-		ConnectionID: connID,
-		Table:        table,
-		OldRecord:    old,
-		NewRecord:    new,
+// DeltaStats reports the Delta's counters.
+func (a *Impl) DeltaStats() types.DeltaStats { return a.txn.Store().Stats() }
+
+// LockStats reports the lock manager's counters.
+func (a *Impl) LockStats() types.LockStats { return a.txn.Locks().Stats() }
+
+// MemoryStats reports the memory guard's readings.
+func (a *Impl) MemoryStats() types.MemoryStats { return a.mem.Stats() }
+
+// Transforms lists the columns plugins declared they transform.
+func (a *Impl) Transforms() []string { return a.p.Transforms() }
+
+// Emit publishes an engine event.
+func (a *Impl) Emit(event string, payload any) { a.p.Emit(event, payload) }
+
+// Delta returns a stable read of the committed Delta.
+func (a *Impl) Delta() types.DeltaReader { return reader{a.txn.Store().Snapshot()} }
+
+type reader struct{ r *delta.Root }
+
+func (d reader) Tables() []types.TableID { return d.r.Tables() }
+
+func (d reader) Rows(t types.TableID, fn func(types.DeltaRowInfo) bool) {
+	tb := d.r.Table(t)
+	if tb == nil {
+		return
 	}
-	result, err := d.pipe.Process(points.PipelineWriteUpdate, payload)
-	if err != nil {
-		return nil, err
+	for _, r := range tb.Copy().Rows() {
+		if !fn(types.DeltaRowInfo{Table: t, Image: r.Image, Row: r.Row, Origin: r.Origin, SourceKey: r.SourceKey}) {
+			return
+		}
 	}
-	return validateWriteUpdateResult(result)
 }
 
-func (d *Impl) RecordDeleted(connID uint32, table string, record map[string]any) error {
-	payload := payloads.WriteDeletePayload{
-		ConnectionID: connID,
-		Table:        table,
-		Record:       record,
+func (d reader) Touched(t types.TableID, fn func(types.TouchedInfo) bool) {
+	tb := d.r.Table(t)
+	if tb == nil {
+		return
 	}
-	_, err := d.pipe.Process(points.PipelineWriteDelete, payload)
-	return err
-}
-
-func (d *Impl) TableTruncated(connID uint32, table string) error {
-	payload := payloads.WriteTruncatePayload{
-		ConnectionID: connID,
-		Table:        table,
+	for _, tc := range tb.Copy().TouchedKeys() {
+		if !fn(types.TouchedInfo{Table: t, Key: tc.Key, Count: tc.Count}) {
+			return
+		}
 	}
-	_, err := d.pipe.Process(points.PipelineWriteTruncate, payload)
-	return err
 }
 
-func (d *Impl) SchemaLoaded(table string, columns []string, pkCol string) {
-	d.schema.Load(table, columns, pkCol)
-	d.bus.Emit(points.EventSchemaLoaded, payloads.SchemaLoadedPayload{
-		Table:   table,
-		Columns: columns,
-		PKCol:   pkCol,
-	})
-}
+// Runner adapts the framework pipeline to session.Runner.
+type Runner struct{ Pipe *framework.Pipeline }
 
-func (d *Impl) SchemaInvalidated(table string) {
-	d.schema.Invalidate(table)
-	d.bus.Emit(points.EventSchemaInvalidated, payloads.SchemaInvalidatedPayload{
-		Table: table,
-	})
-}
+// Process runs a pipeline with the current global context.
+func (r Runner) Process(name string, payload any) (any, error) { return r.Pipe.Process(name, payload) }

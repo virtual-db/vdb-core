@@ -38,6 +38,7 @@ func (h *Handlers) Register(r framework.Registrar) error {
 		{points.PointContextCreateBuildContext, 10, h.ContextCreateBuild},
 		{points.PointContextCreateSeal, 10, h.ContextCreateSeal},
 		{points.PointServerStartBuildContext, 10, h.ServerStartBuild},
+		{points.PointServerStartConfigure, 10, h.RestoreApply},
 		{points.PointServerStartLaunch, 10, h.ServerStartLaunch},
 		{points.PointServerStopBuildContext, 10, h.ServerStopBuild},
 		{points.PointServerStopDrain, 10, h.ServerStopDrain},
@@ -70,6 +71,22 @@ func (h *Handlers) ContextCreateSeal(ctx any, p any) (any, any, error) {
 // ServerStartBuild creates the ServerStartPayload.
 func (h *Handlers) ServerStartBuild(ctx any, _ any) (any, any, error) {
 	return ctx, payloads.ServerStartPayload{}, nil
+}
+
+// RestoreApply replays the change sets a persistence plugin returned in the
+// payload's Restore field, in order, before launch starts the engine (doc 06
+// §2.4). A change set that fails is logged and skipped (D-80).
+func (h *Handlers) RestoreApply(ctx any, p any) (any, any, error) {
+	pl, err := payloads.Decode[payloads.ServerStartPayload](p)
+	if err != nil {
+		return ctx, p, nil
+	}
+	for i := range pl.Restore {
+		if err := h.app.Restore(&pl.Restore[i]); err != nil {
+			log.Printf("core: restore: change set %d: %v", pl.Restore[i].Seq, err)
+		}
+	}
+	return ctx, pl, nil
 }
 
 // ServerStartLaunch starts app.server.Run() in a goroutine.

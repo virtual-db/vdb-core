@@ -1,13 +1,16 @@
-// Package core is the public API of the vdb-core module.
+// Package core is the public API of the vdb-core module: the database-agnostic
+// core of VDB. It holds the Delta, the merge, transactions, locks, the catalog
+// of record, the change log, foreign keys and the memory limit, plus the
+// pipelines, event bus and plugin host (implementation plan doc 03).
 //
-// Consumers of vdb-core should import only this package:
+// Consumers import only this package:
 //
 //	github.com/virtual-db/vdb-core
 //
 // All sub-packages under internal/ are implementation details.
-// The pipeline and event bus engines are provided by github.com/AnqorDX/pipeline
-// and github.com/AnqorDX/dispatch, imported only by internal/framework.
 package core
+
+import "time"
 
 // PointFunc is the handler type for all pipeline point handlers.
 //
@@ -18,41 +21,34 @@ type PointFunc func(ctx any, payload any) (any, any, error)
 // Returning a non-nil error is logged but does not affect other subscribers.
 type EventFunc func(ctx any, payload any) error
 
-// Config holds process-level configuration for core.New().
+// Config holds the settings the core owns. The engine fills it from its own
+// configuration; the core reads no environment variables itself.
 type Config struct {
-	// PluginDir is the directory scanned one level deep for plugin manifests at
-	// startup. An empty string means no plugins are loaded; this is not an error.
+	// PluginDir is scanned one level deep for plugin manifests at start. Empty
+	// means no plugins.
 	PluginDir string
+
+	// Memory (product doc 12 §4).
+	MemoryReserve float64     // fraction kept free; 0.10 by default
+	DeltaMaxBytes uint64      // 0 means no fixed cap
+	MemoryProbe   MemoryProbe // resident memory of every process to count
+
+	// Writes (product doc 10 §5).
+	AutoIncrementGap uint64 // 1,000,000 by default (D-15)
+
+	// Locks (product doc 07 §5).
+	DefaultLockWait time.Duration // used when a statement sends none
+
+	// Reads.
+	CountDeclineKeys int // vdb_count_max_shadowed, 100,000 by default
+	LookupBatch      int // vdb_lookup_batch, 1,000 by default
 }
 
-// Server is the interface the framework calls to manage the database listener.
-// A value satisfying Server must be passed to App.UseDriver before App.Run is called.
+// Server is the interface the framework calls to manage the engine.
+// A value satisfying Server must be passed to App.UseDriver before App.Run.
 type Server interface {
-	// Run binds the network port and blocks until Stop is called or a fatal error occurs.
-	// Port binding MUST happen inside Run, never in the adapter constructor.
+	// Run starts the engine and blocks until Stop is called or a fatal error occurs.
 	Run() error
-
-	// Stop signals Run to return and releases the network port.
+	// Stop signals Run to return.
 	Stop() error
-}
-
-// DriverAPI is the bridge between the database engine adapter and the framework's
-// pipeline-and-event system. Implemented by the framework, not by the application
-// developer or the adapter author.
-type DriverAPI interface {
-	ConnectionOpened(id uint32, user, addr string) error
-	ConnectionClosed(id uint32, user, addr string)
-	TransactionBegun(connID uint32, readOnly bool) error
-	TransactionCommitted(connID uint32) error
-	TransactionRolledBack(connID uint32, savepoint string)
-	QueryReceived(connID uint32, query, database string) (string, error)
-	QueryCompleted(connID uint32, query string, rowsAffected int64, err error)
-	RecordsSource(connID uint32, table string, records []map[string]any) ([]map[string]any, error)
-	RecordsMerged(connID uint32, table string, records []map[string]any) ([]map[string]any, error)
-	RecordInserted(connID uint32, table string, record map[string]any) (map[string]any, error)
-	RecordUpdated(connID uint32, table string, old, new map[string]any) (map[string]any, error)
-	RecordDeleted(connID uint32, table string, record map[string]any) error
-	TableTruncated(connID uint32, table string) error
-	SchemaLoaded(table string, columns []string, pkCol string)
-	SchemaInvalidated(table string)
 }

@@ -22,6 +22,26 @@ func (a *App) UseDriver(s Server) *App {
 	return a
 }
 
+// UseSource registers the engine's Source adapter. Must be called before
+// Run. Panics after Run. Returns *App for method chaining.
+func (a *App) UseSource(s Source) *App {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		panic("core: UseSource called after Run")
+	}
+	a.source = s
+	a.txn.SetSource(s)
+	return a
+}
+
+// HasHandlers reports whether any handler other than the built-in ones is
+// attached to a point. The engine uses it to make vdb.query.received
+// synchronous only when something is attached to intercept.
+func (a *App) HasHandlers(point string) bool {
+	return a.pipe.HasHandlers(point)
+}
+
 // DriverAPI returns the framework's DriverAPI implementation. Pass this to the
 // driver constructor so the driver can call back into the framework.
 //

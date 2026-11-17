@@ -164,3 +164,15 @@ func (m *Manager) Shutdown() {
 	}
 	wg.Wait()
 }
+
+// Transforms returns every column a connected plugin declared it transforms,
+// as "database.table.column".
+func (m *Manager) Transforms() []string {
+	var out []string
+	for _, inst := range m.plugins {
+		inst.mu.Lock()
+		out = append(out, inst.declare.Transforms...)
+		inst.mu.Unlock()
+	}
+	return out
+}
