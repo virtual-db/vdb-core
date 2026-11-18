@@ -2,7 +2,7 @@ package lifecycle
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/virtual-db/vdb-core/internal/framework"
 	"github.com/virtual-db/vdb-core/internal/payloads"
@@ -83,7 +83,7 @@ func (h *Handlers) RestoreApply(ctx any, p any) (any, any, error) {
 	}
 	for i := range pl.Restore {
 		if err := h.app.Restore(&pl.Restore[i]); err != nil {
-			log.Printf("core: restore: change set %d: %v", pl.Restore[i].Seq, err)
+			slog.Warn(fmt.Sprintf("core: restore: change set %d: %v", pl.Restore[i].Seq, err), "pkg", "lifecycle")
 		}
 	}
 	return ctx, pl, nil
@@ -119,7 +119,7 @@ func (h *Handlers) ServerStopHalt(ctx any, p any) (any, any, error) {
 		return ctx, p, nil
 	}
 	if err := srv.Stop(); err != nil {
-		log.Printf("core: server.Stop: %v", err)
+		slog.Warn(fmt.Sprintf("core: server.Stop: %v", err), "pkg", "lifecycle")
 	}
 	return ctx, p, nil
 }

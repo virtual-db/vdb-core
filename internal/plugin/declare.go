@@ -4,7 +4,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 
 	"github.com/virtual-db/vdb-core/internal/framework"
@@ -43,7 +43,7 @@ func (m *Manager) readDeclare(inst *pluginInstance, rawConn net.Conn, bus *frame
 	// 1. Declare plugin-owned pipelines.
 	for _, pd := range params.PipelineDeclarations {
 		if len(pd.Points) == 0 {
-			log.Printf("plugin %q: pipeline %q has no points; skipping declaration", inst.id, pd.Name)
+			slog.Warn(fmt.Sprintf("plugin %q: pipeline %q has no points; skipping declaration", inst.id, pd.Name), "pkg", "plugin")
 			continue
 		}
 		pipe.DeclarePipeline(pd.Name, pd.Points)
@@ -61,7 +61,7 @@ func (m *Manager) readDeclare(inst *pluginInstance, rawConn net.Conn, bus *frame
 			result, err := pc.sendHandlePipelinePoint(h.Point, p)
 			return ctx, result, err
 		}); err != nil {
-			log.Printf("plugin %q: cannot register handler at point %q: %v", inst.id, h.Point, err)
+			slog.Warn(fmt.Sprintf("plugin %q: cannot register handler at point %q: %v", inst.id, h.Point, err), "pkg", "plugin")
 		}
 	}
 
@@ -70,11 +70,11 @@ func (m *Manager) readDeclare(inst *pluginInstance, rawConn net.Conn, bus *frame
 		event := event
 		if err := bus.Subscribe(event, func(_ any, p any) error {
 			if err := pc.sendHandleEvent(event, p); err != nil {
-				log.Printf("plugin %q: handle_event %q failed: %v", inst.id, event, err)
+				slog.Warn(fmt.Sprintf("plugin %q: handle_event %q failed: %v", inst.id, event, err), "pkg", "plugin")
 			}
 			return nil
 		}); err != nil {
-			log.Printf("plugin %q: cannot subscribe to event %q: %v", inst.id, event, err)
+			slog.Warn(fmt.Sprintf("plugin %q: cannot subscribe to event %q: %v", inst.id, event, err), "pkg", "plugin")
 		}
 	}
 

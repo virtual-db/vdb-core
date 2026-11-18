@@ -172,8 +172,8 @@ func newEnv(t *testing.T) *env {
 		Columns: []core.ColumnDef{{Name: "id"}, {Name: "name"}}, Indexes: []core.IndexDef{pk}, Identity: 0,
 		Source: &core.SourceMapping{Database: "shop", Table: "users"}}
 	orders := core.TableDef{Database: "shop", Name: "orders", Kind: core.Mirrored,
-		Columns: []core.ColumnDef{{Name: "id"}, {Name: "user_id", Nullable: true}},
-		Indexes: []core.IndexDef{pk, {ID: 1, Name: "user_id", Columns: []uint16{1}, PartLens: []uint32{8}, OrderProven: true, EqualityProven: true}},
+		Columns:  []core.ColumnDef{{Name: "id"}, {Name: "user_id", Nullable: true}},
+		Indexes:  []core.IndexDef{pk, {ID: 1, Name: "user_id", Columns: []uint16{1}, PartLens: []uint32{8}, OrderProven: true, EqualityProven: true}},
 		Identity: 0, Source: &core.SourceMapping{Database: "shop", Table: "orders"},
 		ForeignKeys: []core.ForeignKeyDef{{Name: "fk_user", Columns: []uint16{1}, ChildIndex: 1, ParentDB: "shop", ParentTable: "users",
 			ParentColumns: []string{"id"}, OnDelete: core.FKCascade, OnUpdate: core.FKRestrict}}}

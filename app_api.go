@@ -2,7 +2,7 @@ package core
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/virtual-db/vdb-core/internal/framework"
 )
@@ -79,7 +79,7 @@ func (a *App) Subscribe(event string, fn EventFunc) *App {
 	}
 	a.mu.Unlock()
 	if err := a.bus.Subscribe(event, framework.EventFunc(fn)); err != nil {
-		log.Printf("core: Subscribe: %v", err)
+		slog.Warn(fmt.Sprintf("core: Subscribe: %v", err), "pkg", "core")
 	}
 	return a
 }

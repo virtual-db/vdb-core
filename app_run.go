@@ -3,7 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -55,7 +55,7 @@ func (a *App) Run() error {
 		}
 		return nil
 	case <-sigCh:
-		log.Printf("core: signal received; initiating graceful shutdown")
+		slog.Warn(fmt.Sprintf("core: signal received; initiating graceful shutdown"), "pkg", "core")
 		a.Stop()
 		return nil
 	case <-a.shutdown:
@@ -74,7 +74,7 @@ func (a *App) Stop() {
 	a.mu.Unlock()
 
 	if _, err := a.global.Pipeline().Process(points.PipelineServerStop, nil); err != nil {
-		log.Printf("core: vdb.server.stop: %v", err)
+		slog.Warn(fmt.Sprintf("core: vdb.server.stop: %v", err), "pkg", "core")
 	}
 
 	close(a.shutdown)

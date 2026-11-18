@@ -6,7 +6,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 )
 
 // readLoop drains the scanner until EOF or error, dispatching every inbound
@@ -17,7 +17,7 @@ func (c *pluginConn) readLoop() {
 
 		var msg rpcResponse
 		if err := json.Unmarshal(line, &msg); err != nil {
-			log.Printf("plugin %q: malformed inbound message: %v", c.inst.id, err)
+			slog.Warn(fmt.Sprintf("plugin %q: malformed inbound message: %v", c.inst.id, err), "pkg", "plugin")
 			continue
 		}
 
@@ -36,17 +36,17 @@ func (c *pluginConn) readLoop() {
 			if ok {
 				ch <- msg
 			} else {
-				log.Printf("plugin %q: response for unknown id %d; discarding", c.inst.id, id)
+				slog.Warn(fmt.Sprintf("plugin %q: response for unknown id %d; discarding", c.inst.id, id), "pkg", "plugin")
 			}
 
 		default:
-			log.Printf("plugin %q: unrecognised inbound message: method=%q hasID=%v",
-				c.inst.id, msg.Method, msg.ID != nil)
+			slog.Warn(fmt.Sprintf("plugin %q: unrecognised inbound message: method=%q hasID=%v",
+				c.inst.id, msg.Method, msg.ID != nil), "pkg", "plugin")
 		}
 	}
 
 	if err := c.scanner.Err(); err != nil {
-		log.Printf("plugin %q: read loop exited with error: %v", c.inst.id, err)
+		slog.Warn(fmt.Sprintf("plugin %q: read loop exited with error: %v", c.inst.id, err), "pkg", "plugin")
 	}
 }
 
@@ -62,12 +62,12 @@ func (c *pluginConn) handleEmitEvent(msg rpcResponse) {
 		ID:      *msg.ID,
 	}
 	if err := c.writeMessage(ack); err != nil {
-		log.Printf("plugin %q: failed to ack emit_event: %v", c.inst.id, err)
+		slog.Warn(fmt.Sprintf("plugin %q: failed to ack emit_event: %v", c.inst.id, err), "pkg", "plugin")
 	}
 
 	var p emitEventParams
 	if err := json.Unmarshal(msg.Params, &p); err != nil {
-		log.Printf("plugin %q: malformed emit_event params: %v", c.inst.id, err)
+		slog.Warn(fmt.Sprintf("plugin %q: malformed emit_event params: %v", c.inst.id, err), "pkg", "plugin")
 		return
 	}
 
@@ -79,7 +79,7 @@ func (c *pluginConn) handleEmitEvent(msg rpcResponse) {
 		}
 	}
 	if !allowed {
-		log.Printf("plugin %q: emit_event for undeclared event %q; ignoring", c.inst.id, p.Event)
+		slog.Warn(fmt.Sprintf("plugin %q: emit_event for undeclared event %q; ignoring", c.inst.id, p.Event), "pkg", "plugin")
 		return
 	}
 
