@@ -7,8 +7,11 @@ on:
 env:
   GONOSUMDB: github.com/AnqorDX/*
 
+# The job names Lint and Test are the status checks that main's branch
+# protection requires.
 jobs:
-  check:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,5 +22,14 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: vet
         run: go vet ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: test
         run: go test -race ./...
