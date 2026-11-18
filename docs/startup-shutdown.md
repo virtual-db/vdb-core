@@ -109,3 +109,9 @@ The internal shutdown channel is closed, unblocking the idle `select` in `Run()`
 | Handler error in `vdb.context.create` | that error |
 | Handler error in `vdb.server.start` | that error |
 | `Run()` called a second time | error |
+## Restore
+
+At `vdb.server.start.configure`, a persistence plugin attached below priority 10 returns change sets in the payload's
+`Restore` field. The built-in handler at priority 10 replays them in order into the Delta and the catalog before
+`launch` starts the engine, so the engine's rebuild sees the restored catalog. A change set that fails is logged and
+skipped (D-80).

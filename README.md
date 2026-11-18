@@ -1,27 +1,28 @@
-# core
+# vdb-core
 
-`github.com/virtual-db/core`
+`github.com/virtual-db/vdb-core`
 
-The Go framework behind VirtualDB. `core` is a transparent intercepting proxy engine — it routes every database operation through an ordered pipeline, maintains an in-memory delta store that overlays writes on top of source data, and manages an event bus and plugin system. It does not speak any wire protocol itself.
+The database-agnostic core of VirtualDB: the Delta (copy-on-write B-trees of rows, touched Source keys and index entries), the merge with the Source, transactions with savepoints and snapshot pairs, row and gap locks with deadlock detection, uniqueness, foreign keys, the catalog of record, change sets for persistence, and the memory limit, plus the pipelines, event bus and plugin host. It never sees SQL: keys are sort images and values are opaque bytes computed by the engine.
 
-A **driver** implements the `Server` interface and calls back into `DriverAPI` as database events occur. A **product** wires a driver to `core`, attaches handlers, and calls `Run`.
+An **engine** (VDB for MySQL is `vdb-mysql`) implements `Server` and `Source`, opens a `Session` per database connection through `DriverAPI`, and calls `Run`.
 
 ---
 
 ## Requirements
 
-- Go 1.23+
-- Module: `github.com/virtual-db/core`
+- Go 1.26.9 (the version every VDB module uses)
+- Module: `github.com/virtual-db/vdb-core`
 
 ---
 
 ## Quick Start
 
 ```go
-app := core.New(core.Config{PluginDir: "plugins"})
+app := core.New(core.Config{PluginDir: "plugins", MemoryProbe: probe})
+app.UseSource(mySourceAdapter)
 
 api := app.DriverAPI()
-srv := mydriver.New(cfg, api)
+srv := myengine.New(cfg, api)
 
 app.
     UseDriver(srv).
@@ -41,7 +42,7 @@ log.Fatal(app.Run())
 
 ## Core Concepts
 
-**Pipeline** — Every database operation runs through a named `vdb.*` pipeline. Each pipeline has an ordered sequence of named points. Handlers attach to a point at a numeric priority; lower numbers run first. Built-in framework handlers reserve priority **10**.
+**Pipeline** — Every database operation runs through a named `vdb.*` pipeline. Each pipeline has an ordered sequence of named points. Handlers attach to a point at a numeric priority; lower numbers run first. Built-in framework handlers reserve priority **10**. A `sync` persistence handler attaches to `vdb.transaction.commit.apply` below 10 (its error fails the commit); a restore handler attaches to `vdb.server.start.configure` below 10 and returns change sets in the payload's `Restore` field.
 
 **Event bus** — After key operations complete the framework emits a named `vdb.*` event. Delivery is fire-and-forget; a subscriber error is logged but does not stop other subscribers.
 
@@ -57,7 +58,9 @@ log.Fatal(app.Run())
 |---|---|
 | `New(cfg Config) *App` | Construct and initialise the framework. |
 | `DriverAPI() DriverAPI` | Get the framework's `DriverAPI` bridge. Call before `UseDriver`. |
-| `UseDriver(s Server) *App` | Register the database server. Must be called before `Run`. |
+| `UseDriver(s Server) *App` | Register the engine's server. Must be called before `Run`. |
+| `UseSource(s Source) *App` | Register the engine's Source adapter. Must be called before `Run`. |
+| `HasHandlers(point string) bool` | Whether anything other than a built-in handler is attached to a point. |
 | `Attach(point string, priority int, fn PointFunc) *App` | Register a handler at a pipeline point. Panics on unknown point or after `Run`. |
 | `Subscribe(event string, fn EventFunc) *App` | Register an event subscriber. Panics after `Run`. |
 | `DeclareEvent(event string)` | Declare a custom event (for extensions and plugins). |
@@ -78,23 +81,31 @@ type Server interface {
     Stop() error
 }
 
-// Implemented by the framework. Called by the driver.
-type DriverAPI interface {
-    ConnectionOpened(id uint32, user, addr string) error
-    ConnectionClosed(id uint32, user, addr string)
-    TransactionBegun(connID uint32, readOnly bool) error
-    TransactionCommitted(connID uint32) error
-    TransactionRolledBack(connID uint32, savepoint string)
-    QueryReceived(connID uint32, query, database string) (string, error)
-    QueryCompleted(connID uint32, query string, rowsAffected int64, err error)
-    RecordsSource(connID uint32, table string, records []map[string]any) ([]map[string]any, error)
-    RecordsMerged(connID uint32, table string, records []map[string]any) ([]map[string]any, error)
-    RecordInserted(connID uint32, table string, record map[string]any) (map[string]any, error)
-    RecordUpdated(connID uint32, table string, old, new map[string]any) (map[string]any, error)
-    RecordDeleted(connID uint32, table string, record map[string]any) error
-    SchemaLoaded(table string, columns []string, pkCol string)
-    SchemaInvalidated(table string)
+// Implemented by the engine: the Source the merge reads (docs/implementing-a-driver.md).
+type Source interface {
+    Snapshot(s SessionInfo, ctx StmtContext) (SourceSnapshot, error)
 }
+
+// Implemented by the core. The engine opens one Session per database connection.
+type DriverAPI interface {
+    OpenSession(info SessionInfo) (Session, error)
+    Kill(connID uint64)
+    Catalog() Catalog
+    ConnectionOpened(connID uint64, account, addr string) error
+    ConnectionClosed(connID uint64, account, addr string)
+    QueryReceived(connID uint64, query, database string) (string, error)
+    QueryCompleted(connID uint64, q QueryInfo)
+    DeltaStats() DeltaStats
+    LockStats() LockStats
+    MemoryStats() MemoryStats
+    Delta() DeltaReader
+    Transforms() []string
+    Emit(event string, payload any)
+}
+
+// Session: statements, transactions and savepoints; Scan, Lookup, Count;
+// Insert, Update, Delete, Truncate, AutoIncrement; staged DDL; End.
+// See types.go and internal/types/api.go for every signature.
 ```
 
 ---
@@ -117,6 +128,7 @@ type DriverAPI interface {
 | `vdb.write.insert` | `build_context` → `apply` → `emit` |
 | `vdb.write.update` | `build_context` → `apply` → `emit` |
 | `vdb.write.delete` | `build_context` → `apply` → `emit` |
+| `vdb.write.truncate` | `build_context` → `apply` → `emit` |
 
 Use `<pipeline>.<point>` as the point name when calling `Attach` (e.g. `vdb.query.received.intercept`).
 
@@ -136,8 +148,13 @@ Use `<pipeline>.<point>` as the point name when calling `Attach` (e.g. `vdb.quer
 | `vdb.record.inserted` | A record lands in the delta as an insert |
 | `vdb.record.updated` | A record overlay lands in the delta |
 | `vdb.record.deleted` | A tombstone lands in the delta |
-| `vdb.schema.loaded` | Table schema is loaded into the cache |
-| `vdb.schema.invalidated` | Cached table schema is invalidated |
+| `vdb.schema.loaded` | (above) A table is added to the catalog of record |
+| `vdb.schema.invalidated` | A table is changed by the Source or by client DDL |
+| `vdb.table.truncated` | A table is truncated (detached from the Source) |
+| `vdb.source.requested` | The engine sent a request to the Source |
+| `vdb.limit.reached` | A memory or lock limit refused a write |
+| `vdb.snapshot.expired` | A Source snapshot expired |
+| `vdb.key.conflict` | A Source row was hidden by an equal Delta key (D-33) |
 
 ---
 
