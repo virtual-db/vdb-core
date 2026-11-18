@@ -83,7 +83,7 @@ func (m *Merge) Scan(tx *txn.Tx, req types.ScanRequest) (*Handle, error) {
 		}
 		sc = &sourceCursor{m: m, tx: tx, d: d, view: view, sc: cur, cols: req.Columns, lock: req.Lock,
 			merged: req.Ordered, dropped: map[string]uint32{}}
-		if view != nil && view.Len()+int(view.State.TouchedN) > 0 {
+		if view != nil && d.ShadowsNeeded() && view.Len()+int(view.State.TouchedN) > 0 {
 			h.shadows = view.ShadowImages()
 		}
 	}

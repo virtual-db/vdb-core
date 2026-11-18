@@ -32,7 +32,7 @@ type fakeSource struct {
 	snapshots int
 }
 
-func (f *fakeSource) Snapshot(core.SessionInfo, core.StmtContext) (core.SourceSnapshot, error) {
+func (f *fakeSource) Reserve(core.SessionInfo, core.StmtContext) (core.SourceSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.snapshots++
@@ -130,6 +130,7 @@ func (s *fakeSnap) ByColumns(t core.TableID, cols core.ColumnSet, values []core.
 }
 
 func (s *fakeSnap) Close() error { return nil }
+func (s *fakeSnap) Start() error { return nil }
 
 type fakeCursor struct {
 	sr   core.SourceRows

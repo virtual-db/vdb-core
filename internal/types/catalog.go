@@ -3,6 +3,8 @@
 // The catalog of record's types (implementation plan doc 06 §1.1).
 package types
 
+import "strings"
+
 // TableKind says where a table's rows come from.
 type TableKind uint8
 
@@ -151,6 +153,29 @@ func (t *TableDef) IdentityColumns() []uint16 {
 		return ix.Columns
 	}
 	return nil
+}
+
+// ShadowsNeeded reports whether a Source row's key can match a Delta key
+// without being byte-equal: only when an identity column has a non-binary
+// collation (product doc 03 §2.4). Shadow sets are skipped otherwise.
+func (t *TableDef) ShadowsNeeded() bool {
+	cols := t.IdentityColumns()
+	if cols == nil {
+		cols = make([]uint16, len(t.Columns))
+		for i := range cols {
+			cols[i] = uint16(i)
+		}
+	}
+	for _, c := range cols {
+		if int(c) >= len(t.Columns) {
+			continue
+		}
+		coll := t.Columns[c].Collation
+		if coll != "" && coll != "binary" && !strings.HasSuffix(coll, "_bin") {
+			return true
+		}
+	}
+	return false
 }
 
 // ColumnByName returns the column's position, or -1.

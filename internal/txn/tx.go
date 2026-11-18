@@ -196,6 +196,16 @@ func (tx *Tx) TakePair(needSource bool) error {
 	if tx.root != nil && (!needSource || tx.srcOpen) {
 		return nil
 	}
+	// Reserve the Source connection before the commit lock: waiting for one
+	// under the lock's read side would hold every commit behind it.
+	var src types.SourceSnapshot
+	if needSource && !tx.srcOpen && tx.m.source != nil {
+		s, err := tx.m.source.Reserve(tx.Info, tx.Ctx)
+		if err != nil {
+			return &types.Error{Code: types.ErrSource, Msg: err.Error()}
+		}
+		src = s
+	}
 	tx.m.commitMu.RLock()
 	defer tx.m.commitMu.RUnlock()
 	if tx.root == nil {
@@ -206,18 +216,21 @@ func (tx *Tx) TakePair(needSource bool) error {
 			nd, err := tx.draft.Rebase(root)
 			if err != nil {
 				tx.mu.Unlock()
+				if src != nil {
+					_ = src.Close()
+				}
 				return err
 			}
 			tx.draft = nd
 			tx.mu.Unlock()
 		}
 	}
-	if needSource && !tx.srcOpen && tx.m.source != nil {
-		s, err := tx.m.source.Snapshot(tx.Info, tx.Ctx)
-		if err != nil {
+	if src != nil {
+		if err := src.Start(); err != nil {
+			_ = src.Close()
 			return &types.Error{Code: types.ErrSource, Msg: err.Error()}
 		}
-		tx.src, tx.srcOpen = s, true
+		tx.src, tx.srcOpen = src, true
 	}
 	return nil
 }

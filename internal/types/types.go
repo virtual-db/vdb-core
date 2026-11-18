@@ -183,11 +183,16 @@ type Batch struct {
 
 // Source is the engine's Source adapter.
 type Source interface {
-	Snapshot(s SessionInfo, ctx StmtContext) (SourceSnapshot, error)
+	// Reserve takes a Source connection for a snapshot without starting it.
+	// It may wait for a free connection, so the core calls it outside the
+	// commit lock; Start then opens the snapshot under that lock (D-35).
+	Reserve(s SessionInfo, ctx StmtContext) (SourceSnapshot, error)
 }
 
 // SourceSnapshot is the Source half of a snapshot pair.
 type SourceSnapshot interface {
+	// Start opens the consistent snapshot on the reserved connection.
+	Start() error
 	Scan(req SourceScan) (SourceCursor, error)
 	Lookup(t TableID, idx IndexID, keys []Key, cols ColumnSet) (SourceRows, error)
 	Exists(t TableID, keys []SourceKey) ([]bool, error)

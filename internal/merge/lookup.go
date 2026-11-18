@@ -59,7 +59,9 @@ func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []ty
 						it.Close()
 						return out, err
 					}
-					if unique {
+					// A unique index holds many NULL keys: only a key with
+					// no NULL part is answered by one row.
+					if unique && !keyHasNull(k) {
 						answered = true
 					}
 				}
@@ -79,7 +81,7 @@ func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []ty
 		if err := m.lookupSource(tx, d, view, idx, keys, pending, cols, mode, whole, &out.Batch, found); err != nil {
 			return out, err
 		}
-		if view != nil && view.Len()+int(view.State.TouchedN) > 0 {
+		if view != nil && d.ShadowsNeeded() && view.Len()+int(view.State.TouchedN) > 0 {
 			out.Shadows = view.ShadowImages()
 		}
 	}
@@ -266,4 +268,14 @@ func (m *Merge) Count(tx *txn.Tx, t types.TableID) (uint64, bool, error) {
 		gone = n
 	}
 	return n - gone + deltaRows, false, nil
+}
+
+// keyHasNull reports whether any part of a lookup key is NULL.
+func keyHasNull(k types.Key) bool {
+	for _, v := range types.DecodeSourceKey(types.SourceKey(k.Raw)) {
+		if v.Null {
+			return true
+		}
+	}
+	return false
 }

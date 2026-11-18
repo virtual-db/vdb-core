@@ -45,9 +45,12 @@ func (c *pluginConn) readLoop() {
 		}
 	}
 
-	if err := c.scanner.Err(); err != nil {
+	err := c.scanner.Err()
+	if err != nil {
 		slog.Warn(fmt.Sprintf("plugin %q: read loop exited with error: %v", c.inst.id, err), "pkg", "plugin")
+		_ = c.conn.Close()
 	}
+	c.failPending(err)
 }
 
 // handleEmitEvent processes an emit_event request from the plugin: acks it,

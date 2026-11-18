@@ -24,6 +24,7 @@ type pluginConn struct {
 
 	pending map[int64]chan rpcResponse
 	pendMu  sync.Mutex
+	lost    bool // the read loop exited: no reply will come
 
 	nextID atomic.Int64
 
@@ -32,10 +33,15 @@ type pluginConn struct {
 }
 
 // newPluginConn constructs a pluginConn around an accepted raw connection.
+// maxMessage bounds one JSON-RPC message; a commit's change set can be large.
+const maxMessage = 256 << 20
+
 func newPluginConn(conn net.Conn, inst *pluginInstance, bus *framework.Bus) *pluginConn {
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 64<<10), maxMessage)
 	return &pluginConn{
 		conn:    conn,
-		scanner: bufio.NewScanner(conn),
+		scanner: sc,
 		pending: make(map[int64]chan rpcResponse),
 		inst:    inst,
 		bus:     bus,
@@ -88,6 +94,10 @@ func (c *pluginConn) sendRequest(method string, params any) (json.RawMessage, er
 	ch := make(chan rpcResponse, 1)
 
 	c.pendMu.Lock()
+	if c.lost {
+		c.pendMu.Unlock()
+		return nil, fmt.Errorf("plugin %q: connection lost", c.inst.id)
+	}
 	c.pending[id] = ch
 	c.pendMu.Unlock()
 
@@ -109,6 +119,22 @@ func (c *pluginConn) sendRequest(method string, params any) (json.RawMessage, er
 		return nil, fmt.Errorf("plugin %q rpc error %d: %s", c.inst.id, resp.Error.Code, resp.Error.Message)
 	}
 	return resp.Result, nil
+}
+
+// failPending answers every waiting request with an error once the read loop
+// has exited, so no caller waits forever on a plug-in that cannot reply.
+func (c *pluginConn) failPending(cause error) {
+	msg := "plugin connection lost"
+	if cause != nil {
+		msg += ": " + cause.Error()
+	}
+	c.pendMu.Lock()
+	c.lost = true
+	for id, ch := range c.pending {
+		ch <- rpcResponse{Error: &rpcError{Code: -32000, Message: msg}}
+		delete(c.pending, id)
+	}
+	c.pendMu.Unlock()
 }
 
 // sendNotification sends a JSON-RPC notification (no ID, no response expected).
