@@ -2,6 +2,8 @@ github.com/AnqorDX/dispatch v0.0.1-alpha-1 h1:CgfetYk16VQApua1MiE26IWE6UvAa9Cn4M
 github.com/AnqorDX/dispatch v0.0.1-alpha-1/go.mod h1:nZpRQcbjEcKCjVvXdhyKhWDlN1PHYvC87+5v+3r2FRI=
 github.com/AnqorDX/pipeline v0.0.1-alpha-1 h1:7PWNJocwRURWApi+WLn6+hLKpnNsjOJXTNOSuDl4w9s=
 github.com/AnqorDX/pipeline v0.0.1-alpha-1/go.mod h1:hGWTih2f7iKSvMk8BHAuLGIcUN7GrVzmN8l3gydnrR4=
+github.com/tidwall/btree v1.8.2 h1:mTY5iM4UTh2e80TG7RHDQQmnAY3xGNQA/DbU0olkhkA=
+github.com/tidwall/btree v1.8.2/go.mod h1:jBbTdUWhSZClZWoDg54VnvV7/54modSOzDN7VXftj1A=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=

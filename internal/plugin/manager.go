@@ -3,7 +3,8 @@ package plugin
 
 import (
 	"errors"
-	"log"
+	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,7 +55,7 @@ func (m *Manager) ConnectAll(bus *framework.Bus, pipe *framework.Pipeline) {
 
 	entries, err := os.ReadDir(m.pluginDir)
 	if err != nil {
-		log.Printf("plugin: cannot read plugin directory %q: %v", m.pluginDir, err)
+		slog.Warn(fmt.Sprintf("plugin: cannot read plugin directory %q: %v", m.pluginDir, err), "pkg", "plugin")
 		return
 	}
 
@@ -68,13 +69,13 @@ func (m *Manager) ConnectAll(bus *framework.Bus, pipe *framework.Pipeline) {
 			continue
 		}
 		if err != nil {
-			log.Printf("plugin: failed to launch plugin in %q: %v", dirPath, err)
+			slog.Warn(fmt.Sprintf("plugin: failed to launch plugin in %q: %v", dirPath, err), "pkg", "plugin")
 			continue
 		}
 
 		pConn, err := m.readDeclare(inst, rawConn, bus, pipe)
 		if err != nil {
-			log.Printf("plugin: %q declare failed: %v; closing connection and killing process", inst.id, err)
+			slog.Warn(fmt.Sprintf("plugin: %q declare failed: %v; closing connection and killing process", inst.id, err), "pkg", "plugin")
 			_ = rawConn.Close()
 			_ = inst.cmd.Process.Kill()
 			continue
@@ -83,8 +84,8 @@ func (m *Manager) ConnectAll(bus *framework.Bus, pipe *framework.Pipeline) {
 		inst.conn = pConn
 		inst.done = make(chan struct{})
 		m.plugins = append(m.plugins, inst)
-		log.Printf("plugin: %q connected (pid %d, version %s)",
-			inst.id, inst.cmd.Process.Pid, inst.manifest.Version)
+		slog.Warn(fmt.Sprintf("plugin: %q connected (pid %d, version %s)",
+			inst.id, inst.cmd.Process.Pid, inst.manifest.Version), "pkg", "plugin")
 		go m.monitorPlugin(inst)
 	}
 }
@@ -106,11 +107,11 @@ func (m *Manager) monitorPlugin(inst *pluginInstance) {
 
 	if !alreadyFailed {
 		if err != nil {
-			log.Printf("plugin %q (pid %d): exited unexpectedly: %v",
-				inst.id, inst.cmd.Process.Pid, err)
+			slog.Warn(fmt.Sprintf("plugin %q (pid %d): exited unexpectedly: %v",
+				inst.id, inst.cmd.Process.Pid, err), "pkg", "plugin")
 		} else {
-			log.Printf("plugin %q (pid %d): exited unexpectedly with exit status 0",
-				inst.id, inst.cmd.Process.Pid)
+			slog.Warn(fmt.Sprintf("plugin %q (pid %d): exited unexpectedly with exit status 0",
+				inst.id, inst.cmd.Process.Pid), "pkg", "plugin")
 		}
 	}
 }
@@ -140,27 +141,39 @@ func (m *Manager) Shutdown() {
 			select {
 			case err := <-shutResult:
 				if err != nil {
-					log.Printf("plugin %q: shutdown request failed: %v; killing process", inst.id, err)
+					slog.Warn(fmt.Sprintf("plugin %q: shutdown request failed: %v; killing process", inst.id, err), "pkg", "plugin")
 					_ = inst.cmd.Process.Kill()
 				}
 			case <-time.After(m.timeout):
-				log.Printf("plugin %q: shutdown timed out after %v; killing process",
-					inst.id, m.timeout)
+				slog.Warn(fmt.Sprintf("plugin %q: shutdown timed out after %v; killing process",
+					inst.id, m.timeout), "pkg", "plugin")
 				_ = inst.cmd.Process.Kill()
 			}
 
 			select {
 			case <-inst.done:
 			case <-time.After(m.timeout):
-				log.Printf("plugin %q: process did not exit after kill; sending SIGKILL again", inst.id)
+				slog.Warn(fmt.Sprintf("plugin %q: process did not exit after kill; sending SIGKILL again", inst.id), "pkg", "plugin")
 				_ = inst.cmd.Process.Kill()
 				select {
 				case <-inst.done:
 				case <-time.After(2 * time.Second):
-					log.Printf("plugin %q: process still alive after second kill; giving up", inst.id)
+					slog.Warn(fmt.Sprintf("plugin %q: process still alive after second kill; giving up", inst.id), "pkg", "plugin")
 				}
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+// Transforms returns every column a connected plugin declared it transforms,
+// as "database.table.column".
+func (m *Manager) Transforms() []string {
+	var out []string
+	for _, inst := range m.plugins {
+		inst.mu.Lock()
+		out = append(out, inst.declare.Transforms...)
+		inst.mu.Unlock()
+	}
+	return out
 }

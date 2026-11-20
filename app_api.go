@@ -2,14 +2,16 @@ package core
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/virtual-db/vdb-core/internal/framework"
 )
 
 // UseDriver registers s as the database server. The composition root calls
 // DriverAPI() explicitly and passes the result to the driver constructor before
-// calling UseDriver.
+// calling UseDriver. When s implements SourceProvider or MemoryProber, its
+// Source and memory probe are registered too, so the composition root never
+// reaches inside the engine.
 //
 // Panics if called after Run has started. Returns *App for method chaining.
 func (a *App) UseDriver(s Server) *App {
@@ -19,7 +21,23 @@ func (a *App) UseDriver(s Server) *App {
 		panic("core: UseDriver called after Run")
 	}
 	a.server = s
+	if sp, ok := s.(SourceProvider); ok {
+		if src := sp.Source(); src != nil {
+			a.source = src
+			a.txn.SetSource(src)
+		}
+	}
+	if mp, ok := s.(MemoryProber); ok {
+		a.mem.SetProbe(mp.MemoryProbe)
+	}
 	return a
+}
+
+// HasHandlers reports whether any handler other than the built-in ones is
+// attached to a point. The engine uses it to make vdb.query.received
+// synchronous only when something is attached to intercept.
+func (a *App) HasHandlers(point string) bool {
+	return a.pipe.HasHandlers(point)
 }
 
 // DriverAPI returns the framework's DriverAPI implementation. Pass this to the
@@ -59,7 +77,7 @@ func (a *App) Subscribe(event string, fn EventFunc) *App {
 	}
 	a.mu.Unlock()
 	if err := a.bus.Subscribe(event, framework.EventFunc(fn)); err != nil {
-		log.Printf("core: Subscribe: %v", err)
+		slog.Warn(fmt.Sprintf("core: Subscribe: %v", err), "pkg", "core")
 	}
 	return a
 }

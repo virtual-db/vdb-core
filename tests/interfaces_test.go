@@ -1,3 +1,7 @@
+// Package core_test — tests/interfaces_test.go
+//
+// Compile-time and runtime checks of the public API's shape: Server,
+// DriverAPI, UseDriver (with its optional Source and probe) and HasHandlers.
 package core_test
 
 import (
@@ -5,8 +9,6 @@ import (
 
 	core "github.com/virtual-db/vdb-core"
 )
-
-// ---- Stub types for compile-time interface satisfaction checks ----
 
 // stubServer satisfies core.Server.
 type stubServer struct{}
@@ -16,37 +18,6 @@ func (s *stubServer) Stop() error { return nil }
 
 var _ core.Server = (*stubServer)(nil)
 
-// noopDriverAPI satisfies core.DriverAPI with no-ops.
-type noopDriverAPI struct{}
-
-func (n *noopDriverAPI) ConnectionOpened(_ uint32, _, _ string) error            { return nil }
-func (n *noopDriverAPI) ConnectionClosed(_ uint32, _, _ string)                  {}
-func (n *noopDriverAPI) TransactionBegun(_ uint32, _ bool) error                 { return nil }
-func (n *noopDriverAPI) TransactionCommitted(_ uint32) error                     { return nil }
-func (n *noopDriverAPI) TransactionRolledBack(_ uint32, _ string)                {}
-func (n *noopDriverAPI) QueryReceived(_ uint32, query, _ string) (string, error) { return query, nil }
-func (n *noopDriverAPI) QueryCompleted(_ uint32, _ string, _ int64, _ error)     {}
-func (n *noopDriverAPI) RecordsSource(_ uint32, _ string, recs []map[string]any) ([]map[string]any, error) {
-	return recs, nil
-}
-func (n *noopDriverAPI) RecordsMerged(_ uint32, _ string, recs []map[string]any) ([]map[string]any, error) {
-	return recs, nil
-}
-func (n *noopDriverAPI) RecordInserted(_ uint32, _ string, rec map[string]any) (map[string]any, error) {
-	return rec, nil
-}
-func (n *noopDriverAPI) RecordUpdated(_ uint32, _ string, _, new map[string]any) (map[string]any, error) {
-	return new, nil
-}
-func (n *noopDriverAPI) RecordDeleted(_ uint32, _ string, _ map[string]any) error { return nil }
-func (n *noopDriverAPI) SchemaLoaded(_ string, _ []string, _ string)              {}
-func (n *noopDriverAPI) SchemaInvalidated(_ string)                               {}
-func (n *noopDriverAPI) TableTruncated(_ uint32, _ string) error                  { return nil }
-
-var _ core.DriverAPI = (*noopDriverAPI)(nil)
-
-// ---- Runtime tests ----
-
 // TestUseDriverReturnsApp verifies UseDriver supports method chaining.
 func TestUseDriverReturnsApp(t *testing.T) {
 	app := core.New(core.Config{})
@@ -55,41 +26,52 @@ func TestUseDriverReturnsApp(t *testing.T) {
 	}
 }
 
-// TestUseDriverNoPanicWithoutDriverReceiver verifies that UseDriver does not panic.
-func TestUseDriverNoPanicWithoutDriverReceiver(t *testing.T) {
-	app := core.New(core.Config{})
-	app.UseDriver(&stubServer{}) // must not panic
+// sourceServer is a Server that supplies a Source and a memory probe.
+type sourceServer struct {
+	src    core.Source
+	probed bool
 }
 
-// TestQueryReceivedReturnsString confirms that QueryReceived returns the query string.
-func TestQueryReceivedReturnsString(t *testing.T) {
-	var api core.DriverAPI = &noopDriverAPI{}
-	q, err := api.QueryReceived(1, "SELECT 1", "testdb")
+func (s *sourceServer) Run() error          { return nil }
+func (s *sourceServer) Stop() error         { return nil }
+func (s *sourceServer) Source() core.Source { return s.src }
+func (s *sourceServer) MemoryProbe() (uint64, error) {
+	s.probed = true
+	return 0, nil
+}
+
+// TestUseDriverTakesSourceAndProbe verifies UseDriver accepts a Server that
+// also supplies a Source and a memory probe, and still chains.
+func TestUseDriverTakesSourceAndProbe(t *testing.T) {
+	app := core.New(core.Config{})
+	srv := &sourceServer{}
+	if got := app.UseDriver(srv); got != app {
+		t.Fatal("UseDriver must return the same *App")
+	}
+}
+
+// TestDriverAPIQueryReceivedPassesThrough confirms that QueryReceived returns
+// the statement unchanged when nothing is attached to intercept.
+func TestDriverAPIQueryReceivedPassesThrough(t *testing.T) {
+	app := core.New(core.Config{})
+	q, err := app.DriverAPI().QueryReceived(1, "SELECT 1", "testdb")
 	if err != nil {
-		t.Fatalf("QueryReceived: unexpected error: %v", err)
+		t.Fatalf("QueryReceived: %v", err)
 	}
 	if q != "SELECT 1" {
-		t.Fatalf("QueryReceived: got %q, want %q", q, "SELECT 1")
+		t.Fatalf("QueryReceived: got %q", q)
 	}
 }
 
-// TestRecordUpdatedReceivesBothRecords confirms that both old and new records are passed.
-func TestRecordUpdatedReceivesBothRecords(t *testing.T) {
-	type capturingAPI struct {
-		noopDriverAPI
-		capturedOld map[string]any
-		capturedNew map[string]any
+// TestHasHandlersIgnoresBuiltins checks that built-in handlers do not count
+// and an attached handler does.
+func TestHasHandlersIgnoresBuiltins(t *testing.T) {
+	app := core.New(core.Config{})
+	if app.HasHandlers("vdb.write.insert.apply") {
+		t.Fatal("built-in apply handler must not count")
 	}
-	api := &capturingAPI{}
-	// Override RecordUpdated inline by just using noopDriverAPI as base and testing directly.
-	oldRec := map[string]any{"id": float64(1), "name": "alice"}
-	newRec := map[string]any{"id": float64(1), "name": "alicia"}
-
-	result, err := api.RecordUpdated(1, "users", oldRec, newRec)
-	if err != nil {
-		t.Fatalf("RecordUpdated: unexpected error: %v", err)
-	}
-	if result["name"] != "alicia" {
-		t.Fatalf("return value name: got %v, want alicia", result["name"])
+	app.Attach("vdb.query.received.intercept", 5, func(ctx, p any) (any, any, error) { return ctx, p, nil })
+	if !app.HasHandlers("vdb.query.received.intercept") {
+		t.Fatal("attached handler must count")
 	}
 }

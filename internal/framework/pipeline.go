@@ -1,6 +1,10 @@
 package framework
 
-import "github.com/AnqorDX/pipeline"
+import (
+	"sync"
+
+	"github.com/AnqorDX/pipeline"
+)
 
 // PointFunc is the handler type for all pipeline point handlers.
 // It is a type alias for pipeline.HandlerFunc, which is:
@@ -21,12 +25,19 @@ type Registrar interface {
 type Pipeline struct {
 	reg    *pipeline.Registry
 	global *GlobalContext
+	ext    *attached
+}
+
+// attached counts handlers attached by anything other than the built-in groups.
+type attached struct {
+	mu sync.Mutex
+	n  map[string]int
 }
 
 // NewPipeline constructs a Pipeline. global must be a pointer to the App's global
 // field so the wrapper always reads the post-seal GlobalContext value.
 func NewPipeline(global *GlobalContext) *Pipeline {
-	return &Pipeline{reg: pipeline.NewRegistry(), global: global}
+	return &Pipeline{reg: pipeline.NewRegistry(), global: global, ext: &attached{n: map[string]int{}}}
 }
 
 // DeclarePipeline registers a named pipeline with its ordered point sequence on
@@ -38,7 +49,34 @@ func (p *Pipeline) DeclarePipeline(name string, points []string) {
 // Attach attaches fn to point at priority. Returns an error if the point
 // does not exist.
 func (p *Pipeline) Attach(point string, priority int, fn PointFunc) error {
-	return p.reg.Register(point, priority, fn)
+	if err := p.reg.Register(point, priority, fn); err != nil {
+		return err
+	}
+	p.ext.mu.Lock()
+	p.ext.n[point]++
+	p.ext.mu.Unlock()
+	return nil
+}
+
+// HasHandlers reports whether anything other than a built-in handler is
+// attached to point.
+func (p *Pipeline) HasHandlers(point string) bool {
+	if p.ext == nil {
+		return false
+	}
+	p.ext.mu.Lock()
+	defer p.ext.mu.Unlock()
+	return p.ext.n[point] > 0
+}
+
+// Builtin returns a Registrar for the built-in handler groups: their
+// handlers are not counted by HasHandlers.
+func (p *Pipeline) Builtin() Registrar { return builtin{p} }
+
+type builtin struct{ p *Pipeline }
+
+func (b builtin) Attach(point string, priority int, fn PointFunc) error {
+	return b.p.reg.Register(point, priority, fn)
 }
 
 // MustAttach is like Attach but panics on error, indicating a framework

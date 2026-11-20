@@ -1,199 +1,120 @@
-// Package write provides write interception and delta overlay handlers.
+// Package write — handlers.go
+//
+// The built-in handlers of the vdb.write.* pipelines: the apply points at
+// priority 10 do the work; build_context stamps correlation ids.
 package write
 
 import (
 	"fmt"
-	"log"
 
-	"github.com/virtual-db/vdb-core/internal/connection"
-	"github.com/virtual-db/vdb-core/internal/delta"
 	"github.com/virtual-db/vdb-core/internal/framework"
 	"github.com/virtual-db/vdb-core/internal/payloads"
 	"github.com/virtual-db/vdb-core/internal/points"
-	"github.com/virtual-db/vdb-core/internal/schema"
+	"github.com/virtual-db/vdb-core/internal/txn"
+	"github.com/virtual-db/vdb-core/internal/types"
 )
 
-// Handlers owns all pipeline points for write interception and delta overlay.
+// TxFor returns the open transaction of a connection.
+type TxFor func(connID uint64) (*txn.Tx, bool)
+
+// Handlers attaches the write pipelines' built-in handlers.
 type Handlers struct {
-	schema *schema.Cache
-	delta  *delta.Delta
-	conns  *connection.State
+	W     *Writer
+	TxFor TxFor
 }
 
-// New returns a Handlers ready for registration.
-func New(sc *schema.Cache, d *delta.Delta, conns *connection.State) *Handlers {
-	return &Handlers{schema: sc, delta: d, conns: conns}
-}
-
-// targetDelta returns the delta that writes from connID should be applied to.
-// When a transaction is open (TxDelta != nil) writes go to the private staging
-// delta so they remain invisible to other connections until COMMIT. Otherwise
-// writes go directly to the shared live delta.
-func (h *Handlers) targetDelta(connID uint32) *delta.Delta {
-	if state, found := h.conns.Get(connID); found && state.TxDelta != nil {
-		return state.TxDelta
-	}
-	return h.delta
-}
-
-// Register attaches all write handlers to r.
-// Points covered:
-//
-//	write.insert.build_context     (10) → framework.BuildContext
-//	write.insert.apply             (10) → h.InsertApply
-//	write.update.build_context     (10) → framework.BuildContext
-//	write.update.apply             (10) → h.UpdateApply
-//	write.delete.build_context     (10) → framework.BuildContext
-//	write.delete.apply             (10) → h.DeleteApply
-//	records.source.build_context   (10) → framework.BuildContext
-//	records.source.transform       (10) → h.RecordsOverlay
-//	records.merged.build_context   (10) → framework.BuildContext
+// Register attaches every handler at priority 10.
 func (h *Handlers) Register(r framework.Registrar) error {
 	for _, reg := range []struct {
-		point    string
-		priority int
-		fn       framework.PointFunc
+		point string
+		fn    framework.PointFunc
 	}{
-		{points.PointWriteInsertBuildContext, 10, framework.BuildContext},
-		{points.PointWriteInsertApply, 10, h.InsertApply},
-		{points.PointWriteUpdateBuildContext, 10, framework.BuildContext},
-		{points.PointWriteUpdateApply, 10, h.UpdateApply},
-		{points.PointWriteDeleteBuildContext, 10, framework.BuildContext},
-		{points.PointWriteDeleteApply, 10, h.DeleteApply},
-		{points.PointWriteTruncateBuildContext, 10, framework.BuildContext},
-		{points.PointWriteTruncateApply, 10, h.TruncateApply},
-		{points.PointRecordsSourceBuildContext, 10, framework.BuildContext},
-		{points.PointRecordsSourceTransform, 10, h.RecordsOverlay},
-		{points.PointRecordsMergedBuildContext, 10, framework.BuildContext},
+		{points.PointWriteInsertBuildContext, framework.BuildContext},
+		{points.PointWriteUpdateBuildContext, framework.BuildContext},
+		{points.PointWriteDeleteBuildContext, framework.BuildContext},
+		{points.PointWriteTruncateBuildContext, framework.BuildContext},
+		{points.PointWriteInsertApply, h.InsertApply},
+		{points.PointWriteUpdateApply, h.UpdateApply},
+		{points.PointWriteDeleteApply, h.DeleteApply},
+		{points.PointWriteTruncateApply, h.TruncateApply},
 	} {
-		if err := r.Attach(reg.point, reg.priority, reg.fn); err != nil {
+		if err := r.Attach(reg.point, 10, reg.fn); err != nil {
 			return fmt.Errorf("write: attach %q: %w", reg.point, err)
 		}
 	}
 	return nil
 }
 
-// InsertApply records a net-new row in the appropriate delta.
-// When the connection has an open transaction the row goes to TxDelta and
-// remains invisible to other connections until COMMIT.
+func (h *Handlers) tx(conn uint64) (*txn.Tx, error) {
+	tx, ok := h.TxFor(conn)
+	if !ok {
+		return nil, &types.Error{Code: types.ErrInternal, Msg: "no open transaction for the connection"}
+	}
+	return tx, nil
+}
+
+// InsertApply inserts the payload's rows and fills Results.
 func (h *Handlers) InsertApply(ctx any, p any) (any, any, error) {
-	payload, err := payloads.Decode[payloads.WriteInsertPayload](p)
+	pl, err := payloads.Decode[payloads.WriteInsertPayload](p)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("write.insert.apply: %w", err)
 	}
-	if _, found := h.schema.Get(payload.Table); !found {
-		log.Printf("write.insert.apply: schema not loaded for table %q; delta key may be incorrect", payload.Table)
+	tx, err := h.tx(pl.ConnectionID)
+	if err != nil {
+		return ctx, nil, err
 	}
-	d := h.targetDelta(payload.ConnectionID)
-	if err := d.ApplyInsert(payload.Table, payload.Record); err != nil {
-		return ctx, nil, fmt.Errorf("write.insert.apply: backend error: %w", err)
+	res, err := h.W.Insert(tx, pl.TableID, pl.Rows, pl.Images)
+	if err != nil {
+		return ctx, nil, err
 	}
-	return ctx, payload, nil
+	pl.Results = res
+	return ctx, pl, nil
 }
 
-// UpdateApply records an upsert overlay in the appropriate delta.
-// When the connection has an open transaction the overlay goes to TxDelta and
-// remains invisible to other connections until COMMIT.
+// UpdateApply replaces the payload's row.
 func (h *Handlers) UpdateApply(ctx any, p any) (any, any, error) {
-	payload, err := payloads.Decode[payloads.WriteUpdatePayload](p)
+	pl, err := payloads.Decode[payloads.WriteUpdatePayload](p)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("write.update.apply: %w", err)
 	}
-	if _, found := h.schema.Get(payload.Table); !found {
-		log.Printf("write.update.apply: schema not loaded for table %q; delta key may be incorrect", payload.Table)
+	tx, err := h.tx(pl.ConnectionID)
+	if err != nil {
+		return ctx, nil, err
 	}
-	d := h.targetDelta(payload.ConnectionID)
-	// When writing to a private TxDelta, pass the live delta as a fallback for
-	// stable-key resolution. This handles chained UPDATEs that span implicit
-	// transaction boundaries: the first UPDATE's currentToStable mapping was
-	// merged into the live delta, so a freshly allocated TxDelta for the second
-	// UPDATE cannot find it without consulting the live delta.
-	var applyErr error
-	if d != h.delta {
-		applyErr = d.ApplyUpdateWithFallback(payload.Table, payload.OldRecord, payload.NewRecord, h.delta)
-	} else {
-		applyErr = d.ApplyUpdate(payload.Table, payload.OldRecord, payload.NewRecord)
+	if err := h.W.Update(tx, pl.TableID, pl.Old, pl.New, pl.Images); err != nil {
+		return ctx, nil, err
 	}
-	if applyErr != nil {
-		return ctx, nil, fmt.Errorf("write.update.apply: backend error: %w", applyErr)
-	}
-	return ctx, payload, nil
+	return ctx, pl, nil
 }
 
-// DeleteApply records a tombstone in the appropriate delta.
-// When the connection has an open transaction the tombstone goes to TxDelta
-// and remains invisible to other connections until COMMIT.
+// DeleteApply removes the payload's row.
 func (h *Handlers) DeleteApply(ctx any, p any) (any, any, error) {
-	payload, err := payloads.Decode[payloads.WriteDeletePayload](p)
+	pl, err := payloads.Decode[payloads.WriteDeletePayload](p)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("write.delete.apply: %w", err)
 	}
-	if _, found := h.schema.Get(payload.Table); !found {
-		log.Printf("write.delete.apply: schema not loaded for table %q; tombstone key may be incorrect", payload.Table)
+	tx, err := h.tx(pl.ConnectionID)
+	if err != nil {
+		return ctx, nil, err
 	}
-	d := h.targetDelta(payload.ConnectionID)
-	// When writing to a private TxDelta, pass the live delta as a fallback for
-	// stable-key resolution. This handles DELETE of a row whose RecordKey
-	// changed due to an UPDATE committed in a prior implicit transaction: the
-	// currentToStable mapping lives in the live delta, not in the fresh TxDelta.
-	var applyErr error
-	if d != h.delta {
-		applyErr = d.ApplyDeleteWithFallback(payload.Table, payload.Record, h.delta)
-	} else {
-		applyErr = d.ApplyDelete(payload.Table, payload.Record)
+	if err := h.W.Delete(tx, pl.TableID, pl.Old); err != nil {
+		return ctx, nil, err
 	}
-	if applyErr != nil {
-		return ctx, nil, fmt.Errorf("write.delete.apply: backend error: %w", applyErr)
-	}
-	return ctx, payload, nil
+	return ctx, pl, nil
 }
 
-// TruncateApply marks a table as truncated in the appropriate delta.
-// All existing mutations for the table are cleared; new inserts after the
-// truncate are still recorded normally via subsequent InsertApply calls.
+// TruncateApply detaches the payload's table.
 func (h *Handlers) TruncateApply(ctx any, p any) (any, any, error) {
-	payload, err := payloads.Decode[payloads.WriteTruncatePayload](p)
+	pl, err := payloads.Decode[payloads.WriteTruncatePayload](p)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("write.truncate.apply: %w", err)
 	}
-	d := h.targetDelta(payload.ConnectionID)
-	d.ApplyTruncate(payload.Table)
-	return ctx, payload, nil
-}
-
-// RecordsOverlay applies delta overlays to source records.
-//
-// When no transaction is open the source records are overlaid with the shared
-// live delta — the existing behaviour.
-//
-// When the connection has an open transaction a second overlay pass is applied
-// on top: the connection's private TxDelta is merged over the result of the
-// first pass. This gives the writing connection read-your-own-writes
-// visibility into its uncommitted changes while keeping those changes
-// completely invisible to every other connection.
-func (h *Handlers) RecordsOverlay(ctx any, p any) (any, any, error) {
-	payload, err := payloads.Decode[payloads.RecordsSourcePayload](p)
+	tx, err := h.tx(pl.ConnectionID)
 	if err != nil {
-		return ctx, nil, fmt.Errorf("records.source.transform: %w", err)
+		return ctx, nil, err
 	}
-
-	// Pass 1: apply the shared live delta (committed state, visible to all).
-	merged, err := Overlay(h.delta, h.schema, payload.Table, payload.Records)
-	if err != nil {
-		return ctx, nil, fmt.Errorf("records.source.transform: live delta overlay failed for table %q: %w", payload.Table, err)
+	if err := h.W.Truncate(tx, pl.TableID); err != nil {
+		return ctx, nil, err
 	}
-
-	// Pass 2: if this connection has an open transaction, layer its private
-	// staging delta on top so it can read its own uncommitted writes.
-	if payload.ConnectionID != 0 {
-		if state, found := h.conns.Get(payload.ConnectionID); found && state.TxDelta != nil {
-			merged, err = Overlay(state.TxDelta, h.schema, payload.Table, merged)
-			if err != nil {
-				return ctx, nil, fmt.Errorf("records.source.transform: tx delta overlay failed for table %q: %w", payload.Table, err)
-			}
-		}
-	}
-
-	payload.Records = merged
-	return ctx, payload, nil
+	return ctx, pl, nil
 }

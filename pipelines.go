@@ -90,7 +90,7 @@ func declarePipelines(p *framework.Pipeline) {
 	})
 }
 
-// declareEvents registers all 12 standard vdb.* event names on the bus.
+// declareEvents registers all standard vdb.* event names on the bus.
 func declareEvents(bus *framework.Bus) {
 	bus.DeclareEvent(points.EventServerStopped)
 	bus.DeclareEvent(points.EventConnectionOpened)
@@ -105,4 +105,8 @@ func declareEvents(bus *framework.Bus) {
 	bus.DeclareEvent(points.EventSchemaLoaded)
 	bus.DeclareEvent(points.EventSchemaInvalidated)
 	bus.DeclareEvent(points.EventTableTruncated)
+	bus.DeclareEvent(points.EventSourceRequested)
+	bus.DeclareEvent(points.EventLimitReached)
+	bus.DeclareEvent(points.EventSnapshotExpired)
+	bus.DeclareEvent(points.EventKeyConflict)
 }

@@ -1,0 +1,44 @@
+# ci.yml: Lint and Test on pull requests and on main. The job names are the
+# status checks main's branch protection requires.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+env:
+  GOPRIVATE: github.com/AnqorDX/*,github.com/virtual-db/*
+  HAS_TOKEN: ${{ secrets.VDB_CI_TOKEN != '' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Access private modules
+        if: env.HAS_TOKEN == 'true'
+        run: git config --global url."https://x-access-token:${{ secrets.VDB_CI_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Access private modules
+        if: env.HAS_TOKEN == 'true'
+        run: git config --global url."https://x-access-token:${{ secrets.VDB_CI_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: test
+        run: go test -race ./...

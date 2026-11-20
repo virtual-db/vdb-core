@@ -16,6 +16,10 @@ type DeclareParams struct {
 	EventSubscriptions   []string       `json:"event_subscriptions"`
 	EventDeclarations    []string       `json:"event_declarations"`
 	PipelineDeclarations []PipelineDecl `json:"pipeline_declarations"`
+	// Transforms lists the columns the plugin transforms, as
+	// "database.table.column"; the engine keeps pushed conditions off them and
+	// declares their indexes unordered (doc 06 §5.3).
+	Transforms []string `json:"transforms,omitempty"`
 }
 
 // HandlerEntry describes one pipeline point a plugin handles.

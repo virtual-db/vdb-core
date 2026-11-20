@@ -5,6 +5,7 @@ package lifecycle
 import (
 	"github.com/virtual-db/vdb-core/internal/framework"
 	"github.com/virtual-db/vdb-core/internal/plugin"
+	"github.com/virtual-db/vdb-core/internal/types"
 )
 
 // Server is the minimal shape lifecycle needs from the DB server.
@@ -24,4 +25,6 @@ type App interface {
 	GetServer() Server
 	ServerErrCh() chan<- error
 	Plugins() *plugin.Manager
+	// Restore replays a restored change set into the Delta and the catalog.
+	Restore(cs *types.ChangeSet) error
 }
