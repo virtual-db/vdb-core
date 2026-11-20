@@ -1,17 +1,19 @@
-// Package lock is the lock manager (implementation plan doc 04 §3, product
-// doc 07 §5): record locks, gap and interval locks, insert intention, waits,
-// the wait-for graph with deadlock victims, and lock memory.
+// Package lock is the lock table (implementation plan doc 04 §3, D-89): it
+// queues, grants, times out and breaks deadlocks, and accounts lock memory.
+// It does not know which locks a statement needs or how modes conflict: the
+// engine defines its modes and a conflict function once (Define), and takes
+// locks on resources it names. vdb-mysql-engine defines InnoDB's record, gap,
+// next-key, interval and insert-intention locks this way.
 //
-// Record locks are keyed by (table, identity-key image). Gap, interval and
-// whole-index insert locks are keyed by (table, index) and an image range.
-// Compatibility follows InnoDB's matrix: gap locks never conflict with each
-// other; an insert-intention lock waits for any gap or interval lock covering
-// its image held by another transaction; record locks follow shared and
-// exclusive rules; interval locks behave as the record locks of every row in
-// their range plus the gaps between them.
+// A resource is one key image, one range of images, or a whole index, within
+// (table, index). Two resources overlap when they are in the same (table,
+// index) and name the same point, a point inside a range, overlapping ranges,
+// or anything and a whole index. The engine's Conflicts is asked only about
+// overlapping resources held by other transactions.
 package lock
 
 import (
+	"bytes"
 	"sort"
 	"sync"
 	"time"
@@ -20,42 +22,24 @@ import (
 	"github.com/virtual-db/vdb-core/internal/types"
 )
 
-// Kind is a lock kind.
-type Kind uint8
-
-const (
-	Record Kind = iota
-	Gap
-	Interval
-	InsertIntention
-)
-
 // EntrySize is the accounted size of one lock entry.
 const EntrySize = 160
-
-// Request describes one lock to take.
-type Request struct {
-	Table types.TableID
-	Index types.IndexID
-	Kind  Kind
-	Mode  types.LockMode // LockShared or LockExclusive
-	Key   types.KeyImage // Record, InsertIntention
-	Range types.ImageRange
-}
 
 // Waiter describes the transaction asking for a lock.
 type Waiter struct {
 	Tx      uint64 // transaction id; a larger id is a younger transaction
-	Conn    uint64 // the mysqld connection id, reported to lock waiters
+	Conn    uint64 // the engine's connection id, reported to lock waiters
 	Timeout time.Duration
 	Killed  <-chan struct{}
 	OnWait  types.WaitFunc
 }
 
 type entry struct {
-	req  Request
+	res  types.Resource
+	mode types.LockMode
 	tx   uint64
 	conn uint64
+	seq  uint64
 }
 
 type slot struct {
@@ -68,24 +52,27 @@ type Reserver interface {
 	Reserve(n int, kind string) error
 }
 
-// Manager is the environment's lock manager. Safe for concurrent use.
+// Manager is the environment's lock table. Safe for concurrent use.
 type Manager struct {
 	mu      sync.Mutex
-	records map[slot]map[string][]*entry
-	ranges  map[slot][]*entry
+	modes   types.LockModes
+	points  map[slot]map[string][]*entry
+	ranges  map[slot][]*entry // ranges and whole-index entries
 	byTx    map[uint64][]*entry
 	waitFor map[uint64]map[uint64]bool
 	victims map[uint64]chan struct{}
 	changed chan struct{}
 	mem     Reserver
+	seq     uint64
 
 	entries, waits, deadlocks, timeouts uint64
 }
 
-// New returns an empty manager.
+// New returns an empty lock table. Until Define is called every two locks on
+// overlapping resources conflict.
 func New(mem Reserver) *Manager {
 	return &Manager{
-		records: map[slot]map[string][]*entry{},
+		points:  map[slot]map[string][]*entry{},
 		ranges:  map[slot][]*entry{},
 		byTx:    map[uint64][]*entry{},
 		waitFor: map[uint64]map[uint64]bool{},
@@ -95,100 +82,120 @@ func New(mem Reserver) *Manager {
 	}
 }
 
-func modesConflict(a, b types.LockMode) bool {
-	return a == types.LockExclusive || b == types.LockExclusive
+// Define installs the engine's lock modes. Called once, before the first lock.
+func (m *Manager) Define(modes types.LockModes) {
+	m.mu.Lock()
+	m.modes = modes
+	m.mu.Unlock()
 }
+
+func (m *Manager) conflict(held, wanted types.LockMode, hr, wr types.Resource) bool {
+	if m.modes.Conflicts == nil {
+		return true
+	}
+	return m.modes.Conflicts(held, wanted, hr, wr)
+}
+
+func (m *Manager) waitOnly(mode types.LockMode) bool {
+	return m.modes.WaitOnly != nil && m.modes.WaitOnly(mode)
+}
+
+func (m *Manager) covers(held, wanted types.LockMode) bool {
+	if m.modes.Covers == nil {
+		return held == wanted
+	}
+	return m.modes.Covers(held, wanted)
+}
+
+func isPoint(r types.Resource) bool { return !r.Whole && r.Range == nil }
 
 func rangesOverlap(a, b types.ImageRange) bool {
 	return (len(a.Low) == 0 || delta.InHigh(a.Low, b)) && (len(b.Low) == 0 || delta.InHigh(b.Low, a))
 }
 
-// conflicts returns the holders of locks incompatible with r, other than tx.
-func (m *Manager) conflicts(tx uint64, r Request) []*entry {
+// overlap reports whether two resources of the same slot overlap.
+func overlap(a, b types.Resource) bool {
+	switch {
+	case a.Whole || b.Whole:
+		return true
+	case isPoint(a) && isPoint(b):
+		return bytes.Equal(a.Point, b.Point)
+	case isPoint(a):
+		return delta.InRange(a.Point, *b.Range)
+	case isPoint(b):
+		return delta.InRange(b.Point, *a.Range)
+	default:
+		return rangesOverlap(*a.Range, *b.Range)
+	}
+}
+
+func sameResource(a, b types.Resource) bool {
+	if a.Table != b.Table || a.Index != b.Index || a.Whole != b.Whole || isPoint(a) != isPoint(b) {
+		return false
+	}
+	if a.Whole {
+		return true
+	}
+	if isPoint(a) {
+		return bytes.Equal(a.Point, b.Point)
+	}
+	x, y := *a.Range, *b.Range
+	return bytes.Equal(x.Low, y.Low) && bytes.Equal(x.High, y.High) && x.LowIncl == y.LowIncl && x.HighIncl == y.HighIncl
+}
+
+// conflicts returns the entries of other transactions that block r in mode.
+func (m *Manager) conflicts(tx uint64, r types.Resource, mode types.LockMode) []*entry {
 	var out []*entry
 	s := slot{r.Table, r.Index}
-	switch r.Kind {
-	case Record:
-		for _, e := range m.records[s][string(r.Key)] {
-			if e.tx != tx && modesConflict(e.req.Mode, r.Mode) {
-				out = append(out, e)
-			}
+	check := func(e *entry) {
+		if e.tx != tx && overlap(e.res, r) && m.conflict(e.mode, mode, e.res, r) {
+			out = append(out, e)
 		}
-		for _, e := range m.ranges[s] {
-			if e.tx != tx && e.req.Kind == Interval && delta.InRange(r.Key, e.req.Range) && modesConflict(e.req.Mode, r.Mode) {
-				out = append(out, e)
-			}
+	}
+	if isPoint(r) {
+		for _, e := range m.points[s][string(r.Point)] {
+			check(e)
 		}
-	case InsertIntention:
-		for _, e := range m.ranges[s] {
-			if e.tx != tx && (e.req.Kind == Gap || e.req.Kind == Interval) && delta.InRange(r.Key, e.req.Range) {
-				out = append(out, e)
-			}
-		}
-	case Interval:
-		for _, e := range m.ranges[s] {
-			if e.tx != tx && e.req.Kind == Interval && rangesOverlap(e.req.Range, r.Range) && modesConflict(e.req.Mode, r.Mode) {
-				out = append(out, e)
-			}
-		}
-		for k, es := range m.records[s] {
-			if !delta.InRange(types.KeyImage(k), r.Range) {
-				continue
-			}
+	} else {
+		for _, es := range m.points[s] {
 			for _, e := range es {
-				if e.tx != tx && modesConflict(e.req.Mode, r.Mode) {
-					out = append(out, e)
-				}
+				check(e)
 			}
 		}
-	case Gap:
-		// Gap locks conflict with nothing; only insert intention waits for them.
+	}
+	for _, e := range m.ranges[s] {
+		check(e)
 	}
 	return out
 }
 
-func (m *Manager) holds(tx uint64, r Request) bool {
-	s := slot{r.Table, r.Index}
-	switch r.Kind {
-	case Record:
-		for _, e := range m.records[s][string(r.Key)] {
-			if e.tx == tx && (e.req.Mode == types.LockExclusive || r.Mode == types.LockShared) {
-				return true
-			}
-		}
-	case Gap, Interval:
-		for _, e := range m.byTx[tx] {
-			if e.req.Kind == r.Kind && e.req.Table == r.Table && e.req.Index == r.Index &&
-				string(e.req.Range.Low) == string(r.Range.Low) && string(e.req.Range.High) == string(r.Range.High) &&
-				e.req.Range.LowIncl == r.Range.LowIncl && e.req.Range.HighIncl == r.Range.HighIncl &&
-				(e.req.Mode == types.LockExclusive || r.Mode != types.LockExclusive) {
-				return true
-			}
+func (m *Manager) holds(tx uint64, r types.Resource, mode types.LockMode) bool {
+	for _, e := range m.byTx[tx] {
+		if sameResource(e.res, r) && m.covers(e.mode, mode) {
+			return true
 		}
 	}
 	return false
 }
 
-// Acquire takes the lock for w, waiting while another transaction holds an
-// incompatible one. It returns ErrLockWaitTimeout, ErrDeadlock, ErrKilled or
-// ErrLockMemory, or nil when granted. Insert-intention locks are not kept
-// once granted: they only wait.
-func (m *Manager) Acquire(w Waiter, r Request) error {
-	if r.Mode == types.LockNone {
-		r.Mode = types.LockShared
-	}
+// Acquire takes a lock for w, waiting while another transaction holds a
+// conflicting one. It returns ErrLockWaitTimeout, ErrDeadlock, ErrKilled or
+// ErrLockMemory, or nil when granted. A lock of a wait-only mode is not kept
+// once granted: it only waits.
+func (m *Manager) Acquire(w Waiter, r types.Resource, mode types.LockMode) error {
 	var deadline <-chan time.Time
 	reported := false
 	for {
 		m.mu.Lock()
-		if r.Kind != InsertIntention && m.holds(w.Tx, r) {
+		wo := m.waitOnly(mode)
+		if !wo && m.holds(w.Tx, r, mode) {
 			m.mu.Unlock()
 			return nil
 		}
-		cs := m.conflicts(w.Tx, r)
+		cs := m.conflicts(w.Tx, r, mode)
 		if len(cs) == 0 {
 			delete(m.waitFor, w.Tx)
-			if r.Kind == InsertIntention {
+			if wo {
 				m.mu.Unlock()
 				return nil
 			}
@@ -198,7 +205,7 @@ func (m *Manager) Acquire(w Waiter, r Request) error {
 					return err
 				}
 			}
-			m.grant(w, r)
+			m.grant(w, r, mode)
 			m.mu.Unlock()
 			return nil
 		}
@@ -273,16 +280,17 @@ func (m *Manager) Acquire(w Waiter, r Request) error {
 	}
 }
 
-func (m *Manager) grant(w Waiter, r Request) {
-	e := &entry{req: r, tx: w.Tx, conn: w.Conn}
+func (m *Manager) grant(w Waiter, r types.Resource, mode types.LockMode) {
+	m.seq++
+	e := &entry{res: r, mode: mode, tx: w.Tx, conn: w.Conn, seq: m.seq}
 	s := slot{r.Table, r.Index}
-	if r.Kind == Record {
-		mm := m.records[s]
+	if isPoint(r) {
+		mm := m.points[s]
 		if mm == nil {
 			mm = map[string][]*entry{}
-			m.records[s] = mm
+			m.points[s] = mm
 		}
-		mm[string(r.Key)] = append(mm[string(r.Key)], e)
+		mm[string(r.Point)] = append(mm[string(r.Point)], e)
 	} else {
 		m.ranges[s] = append(m.ranges[s], e)
 	}
@@ -320,6 +328,17 @@ func (m *Manager) cycleFrom(start uint64) []uint64 {
 	return nil
 }
 
+// Mark returns the position of tx's newest lock, for ReleaseSince.
+func (m *Manager) Mark(tx uint64) types.LockMark {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	es := m.byTx[tx]
+	if len(es) == 0 {
+		return types.LockMark(m.seq)
+	}
+	return types.LockMark(es[len(es)-1].seq)
+}
+
 // ReleaseAll drops every lock tx holds and wakes waiters.
 func (m *Manager) ReleaseAll(tx uint64) {
 	m.mu.Lock()
@@ -327,19 +346,18 @@ func (m *Manager) ReleaseAll(tx uint64) {
 	m.releaseLocked(tx, func(*entry) bool { return true })
 }
 
-// ReleaseIf drops the record locks of tx for which drop returns true
-// (statement rollback at READ COMMITTED releases the locks it took).
-func (m *Manager) ReleaseIf(tx uint64, drop func(table types.TableID, key types.KeyImage) bool) {
+// ReleaseSince drops the locks tx took after mark.
+func (m *Manager) ReleaseSince(tx uint64, mark types.LockMark) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseLocked(tx, func(e *entry) bool { return e.req.Kind == Record && drop(e.req.Table, e.req.Key) })
+	m.releaseLocked(tx, func(e *entry) bool { return e.seq > uint64(mark) })
 }
 
-// ReleaseGaps drops the gap and interval locks of tx (READ COMMITTED keeps none).
-func (m *Manager) ReleaseGaps(tx uint64) {
+// ReleaseIf drops the locks of tx for which drop returns true.
+func (m *Manager) ReleaseIf(tx uint64, drop func(r types.Resource, mode types.LockMode) bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseLocked(tx, func(e *entry) bool { return e.req.Kind != Record })
+	m.releaseLocked(tx, func(e *entry) bool { return drop(e.res, e.mode) })
 }
 
 func (m *Manager) releaseLocked(tx uint64, drop func(*entry) bool) {
@@ -351,9 +369,10 @@ func (m *Manager) releaseLocked(tx uint64, drop func(*entry) bool) {
 			continue
 		}
 		n++
-		s := slot{e.req.Table, e.req.Index}
-		if e.req.Kind == Record {
-			es := m.records[s][string(e.req.Key)]
+		s := slot{e.res.Table, e.res.Index}
+		if isPoint(e.res) {
+			k := string(e.res.Point)
+			es := m.points[s][k]
 			for i, x := range es {
 				if x == e {
 					es = append(es[:i], es[i+1:]...)
@@ -361,9 +380,9 @@ func (m *Manager) releaseLocked(tx uint64, drop func(*entry) bool) {
 				}
 			}
 			if len(es) == 0 {
-				delete(m.records[s], string(e.req.Key))
+				delete(m.points[s], k)
 			} else {
-				m.records[s][string(e.req.Key)] = es
+				m.points[s][k] = es
 			}
 		} else {
 			es := m.ranges[s]
@@ -392,7 +411,7 @@ func (m *Manager) releaseLocked(tx uint64, drop func(*entry) bool) {
 	}
 }
 
-// Stats reports the lock manager's counters.
+// Stats reports the lock table's counters.
 func (m *Manager) Stats() types.LockStats {
 	m.mu.Lock()
 	defer m.mu.Unlock()

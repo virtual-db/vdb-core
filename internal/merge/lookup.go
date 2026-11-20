@@ -7,7 +7,6 @@ import (
 	"strconv"
 
 	"github.com/virtual-db/vdb-core/internal/delta"
-	"github.com/virtual-db/vdb-core/internal/lock"
 	"github.com/virtual-db/vdb-core/internal/txn"
 	"github.com/virtual-db/vdb-core/internal/types"
 )
@@ -21,7 +20,7 @@ type LookupResult struct {
 
 // Lookup answers keys on index idx: the Delta first, the Source only for the
 // keys the Delta does not decide. Each row carries the index of the key it answers.
-func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []types.Key, cols types.ColumnSet, mode types.LockMode) (LookupResult, error) {
+func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []types.Key, cols types.ColumnSet, lk *types.ReadLocks) (LookupResult, error) {
 	d, err := def(tx, t)
 	if err != nil {
 		return LookupResult{}, err
@@ -45,7 +44,7 @@ func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []ty
 		if view != nil {
 			if identity {
 				if r, ok := view.Get(k.Image); ok {
-					if err := m.addDelta(tx, d, &out.Batch, r, uint32(i), cols, mode, whole); err != nil {
+					if err := m.addDelta(tx, d, &out.Batch, r, uint32(i), cols, lk, whole); err != nil {
 						return out, err
 					}
 					answered = true
@@ -55,7 +54,7 @@ func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []ty
 			} else {
 				it := view.IndexInRange(idx, types.ImageRange{Low: k.Image, High: k.Image, LowIncl: true, HighIncl: true}, types.Forward)
 				for r := it.Next(); r != nil; r = it.Next() {
-					if err := m.addDelta(tx, d, &out.Batch, r, uint32(i), cols, mode, whole); err != nil {
+					if err := m.addDelta(tx, d, &out.Batch, r, uint32(i), cols, lk, whole); err != nil {
 						it.Close()
 						return out, err
 					}
@@ -78,19 +77,19 @@ func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []ty
 		found[ki] = true
 	}
 	if len(pending) > 0 && hasSource(d, view) {
-		if err := m.lookupSource(tx, d, view, idx, keys, pending, cols, mode, whole, &out.Batch, found); err != nil {
+		if err := m.lookupSource(tx, d, view, idx, keys, pending, cols, lk, whole, &out.Batch, found); err != nil {
 			return out, err
 		}
 		if view != nil && d.ShadowsNeeded() && view.Len()+int(view.State.TouchedN) > 0 {
 			out.Shadows = view.ShadowImages()
 		}
 	}
-	// An equality lookup on a unique index that finds nothing takes a gap lock (D-64).
-	if mode != types.LockNone && unique && tx.Gaps() {
+	// The engine's Missing hook sees every key a unique lookup did not find
+	// (for InnoDB, a gap lock, D-64).
+	if lk != nil && lk.Missing != nil && unique {
 		for i, k := range keys {
 			if !found[i] {
-				if err := tx.Lock(lock.Request{Table: t, Index: idx, Kind: lock.Gap, Mode: types.LockShared,
-					Range: types.ImageRange{Low: k.Image, High: k.Image, LowIncl: true, HighIncl: true}}); err != nil {
+				if err := lk.Missing(t, idx, k.Image); err != nil {
 					return out, err
 				}
 			}
@@ -101,9 +100,9 @@ func (m *Merge) Lookup(tx *txn.Tx, t types.TableID, idx types.IndexID, keys []ty
 	return out, err2
 }
 
-func (m *Merge) addDelta(tx *txn.Tx, d *types.TableDef, b *types.Batch, r *delta.DeltaRow, ki uint32, cols types.ColumnSet, mode types.LockMode, whole bool) error {
-	if mode != types.LockNone {
-		if err := LockRow(tx, d.ID, r.SourceKey, r.Image, mode); err != nil {
+func (m *Merge) addDelta(tx *txn.Tx, d *types.TableDef, b *types.Batch, r *delta.DeltaRow, ki uint32, cols types.ColumnSet, lk *types.ReadLocks, whole bool) error {
+	if lk != nil && lk.Row != nil {
+		if err := lk.Row(d.ID, types.LockKey(r.SourceKey, r.Image)); err != nil {
 			return err
 		}
 		latest, _ := tx.Latest(d.ID, r.Image, nil)
@@ -119,7 +118,7 @@ func (m *Merge) addDelta(tx *txn.Tx, d *types.TableDef, b *types.Batch, r *delta
 }
 
 func (m *Merge) lookupSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, idx types.IndexID, keys []types.Key, pending []int,
-	cols types.ColumnSet, mode types.LockMode, whole bool, b *types.Batch, found []bool) error {
+	cols types.ColumnSet, lk *types.ReadLocks, whole bool, b *types.Batch, found []bool) error {
 	snap, err := tx.Source()
 	if err != nil {
 		return err
@@ -134,7 +133,7 @@ func (m *Merge) lookupSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, i
 			for j := range sr.KeyIdx {
 				sr.KeyIdx[j] = uint32(i)
 			}
-			if err := m.addSource(tx, d, view, sr, cols, mode, whole, b, found); err != nil {
+			if err := m.addSource(tx, d, view, sr, cols, lk, whole, b, found); err != nil {
 				return err
 			}
 			continue
@@ -175,7 +174,7 @@ func (m *Merge) lookupSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, i
 			}
 			tx.LookupCache[ck] = c
 		}
-		if err := m.addSource(tx, d, view, sr, cols, mode, whole, b, found); err != nil {
+		if err := m.addSource(tx, d, view, sr, cols, lk, whole, b, found); err != nil {
 			return err
 		}
 	}
@@ -183,8 +182,8 @@ func (m *Merge) lookupSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, i
 }
 
 func (m *Merge) addSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, sr types.SourceRows, cols types.ColumnSet,
-	mode types.LockMode, whole bool, b *types.Batch, found []bool) error {
-	fb, orig, err := m.filterSourceIdx(tx, d, view, sr, cols, mode, whole, nil)
+	lk *types.ReadLocks, whole bool, b *types.Batch, found []bool) error {
+	fb, orig, err := m.filterSourceIdx(tx, d, view, sr, cols, lk, whole, nil)
 	if err != nil {
 		return err
 	}

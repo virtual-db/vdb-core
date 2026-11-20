@@ -90,7 +90,6 @@ type WriteTruncatePayload struct {
 type TransactionBeginPayload struct {
 	ConnectionID uint64
 	ReadOnly     bool
-	Isolation    types.Isolation
 }
 
 // TransactionCommitPayload is the payload of vdb.transaction.commit and of the

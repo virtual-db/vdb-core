@@ -19,8 +19,14 @@ type (
 	Origin            = types.Origin
 	RowRef            = types.RowRef
 	SessionInfo       = types.SessionInfo
-	Isolation         = types.Isolation
 	LockMode          = types.LockMode
+	Resource          = types.Resource
+	LockModes         = types.LockModes
+	LockMark          = types.LockMark
+	Locks             = types.Locks
+	ReadLocks         = types.ReadLocks
+	SnapshotScope     = types.SnapshotScope
+	ReadView          = types.ReadView
 	EvalContext       = types.EvalContext
 	StmtContext       = types.StmtContext
 	ImageRange        = types.ImageRange
@@ -38,7 +44,6 @@ type (
 	SourceRows        = types.SourceRows
 	MemoryProbe       = types.MemoryProbe
 	RowProvider       = types.RowProvider
-	ImageFunc         = types.ImageFunc
 	WaitFunc          = types.WaitFunc
 	ErrorCode         = types.ErrorCode
 	Error             = types.Error
@@ -51,7 +56,6 @@ type (
 	RowOp             = types.RowOp
 	RowChange         = types.RowChange
 	TouchChange       = types.TouchChange
-	AutoIncMove       = types.AutoIncMove
 	ChangeSet         = types.ChangeSet
 	TableKind         = types.TableKind
 	FetchMode         = types.FetchMode
@@ -83,20 +87,14 @@ type (
 const (
 	OriginSource         = types.OriginSource
 	OriginDelta          = types.OriginDelta
-	RepeatableRead       = types.RepeatableRead
-	ReadCommitted        = types.ReadCommitted
-	ReadUncommitted      = types.ReadUncommitted
-	Serializable         = types.Serializable
-	LockNone             = types.LockNone
-	LockShared           = types.LockShared
-	LockExclusive        = types.LockExclusive
 	Forward              = types.Forward
 	Backward             = types.Backward
 	ErrNone              = types.ErrNone
+	PerTransaction       = types.PerTransaction
+	PerStatement         = types.PerStatement
+	ViewSnapshot         = types.ViewSnapshot
+	ViewUncommitted      = types.ViewUncommitted
 	ErrDuplicateKey      = types.ErrDuplicateKey
-	ErrNoReferencedRow   = types.ErrNoReferencedRow
-	ErrRowIsReferenced   = types.ErrRowIsReferenced
-	ErrFKDepth           = types.ErrFKDepth
 	ErrLockWaitTimeout   = types.ErrLockWaitTimeout
 	ErrDeadlock          = types.ErrDeadlock
 	ErrDeltaFull         = types.ErrDeltaFull
@@ -162,3 +160,7 @@ var (
 	CloneRow        = types.CloneRow
 	Project         = types.Project
 )
+
+// LockKey is the lock key of a row: its Source key bytes when it has them,
+// else its identity image (see ReadLocks).
+func LockKey(sk SourceKey, img KeyImage) KeyImage { return types.LockKey(sk, img) }

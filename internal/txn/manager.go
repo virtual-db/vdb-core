@@ -1,12 +1,11 @@
 // Package txn — manager.go
 //
 // The transaction manager: the commit lock, commit sequence numbers, open
-// transactions (for READ UNCOMMITTED), auto-increment counters, and commit.
+// transactions (for the uncommitted read view), and commit.
 package txn
 
 import (
 	"fmt"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -32,26 +31,16 @@ type Manager struct {
 	commitMu sync.RWMutex
 	nextTx   atomic.Uint64
 	commit   CommitFunc
-	autoGap  uint64
 
 	mu      sync.Mutex
 	open    map[uint64]*Tx
 	pending map[uint64]*Tx // by connection id, while its commit pipeline runs
-
-	autoMu sync.Mutex
-	auto   map[types.TableID]*counter
-}
-
-type counter struct {
-	mu     sync.Mutex
-	next   uint64
-	seeded bool
 }
 
 // New returns a manager.
-func New(store *delta.Store, locks *lock.Manager, cat *catalog.Catalog, seq *changelog.Sequence, autoGap uint64) *Manager {
-	return &Manager{store: store, locks: locks, catalog: cat, Seq: seq, autoGap: autoGap,
-		open: map[uint64]*Tx{}, pending: map[uint64]*Tx{}, auto: map[types.TableID]*counter{}}
+func New(store *delta.Store, locks *lock.Manager, cat *catalog.Catalog, seq *changelog.Sequence) *Manager {
+	return &Manager{store: store, locks: locks, catalog: cat, Seq: seq,
+		open: map[uint64]*Tx{}, pending: map[uint64]*Tx{}}
 }
 
 // SetSource installs the engine's Source adapter.
@@ -71,7 +60,7 @@ func (m *Manager) Catalog() *catalog.Catalog { return m.catalog }
 
 // Begin starts a transaction. No snapshot is taken yet.
 func (m *Manager) Begin(info types.SessionInfo, ctx types.StmtContext) *Tx {
-	tx := &Tx{m: m, ID: m.nextTx.Add(1), Info: info, Iso: ctx.Isolation, ReadOnly: ctx.ReadOnly, Ctx: ctx}
+	tx := &Tx{m: m, ID: m.nextTx.Add(1), Info: info, ReadOnly: ctx.ReadOnly, Ctx: ctx}
 	m.mu.Lock()
 	m.open[tx.ID] = tx
 	m.mu.Unlock()
@@ -84,9 +73,9 @@ func (m *Manager) forget(tx *Tx) {
 	m.mu.Unlock()
 }
 
-// uncommitted builds the READ UNCOMMITTED view of a table: the current
-// committed state overlaid with every open transaction's writes to it. Row
-// locks ensure at most one uncommitted version per row (D-63).
+// uncommitted builds the uncommitted view of a table: the current committed
+// state overlaid with every open transaction's writes to it. The engine's row
+// locks ensure at most one uncommitted version per row.
 func (m *Manager) uncommitted(self *Tx, t types.TableID) (*delta.Table, error) {
 	root := m.store.Snapshot()
 	var ops []delta.Op
@@ -127,7 +116,7 @@ func (tx *Tx) Commit() error {
 		return nil
 	}
 	m := tx.m
-	if !tx.Writes() && len(tx.AutoInc) == 0 {
+	if !tx.Writes() {
 		tx.Rollback()
 		return nil
 	}
@@ -135,7 +124,6 @@ func (tx *Tx) Commit() error {
 	seq := m.Seq.Next()
 	cs := changelog.FromOps(seq, types.ChangeCommit, tx.Ops())
 	cs.Catalog = append(cs.Catalog, tx.ddl...)
-	cs.AutoInc = append(cs.AutoInc, tx.AutoInc...)
 	m.mu.Lock()
 	m.pending[tx.Info.ConnID] = tx
 	m.mu.Unlock()
@@ -220,93 +208,6 @@ func (m *Manager) Replay(cs *types.ChangeSet) error {
 	for _, o := range cs.Objects {
 		m.catalog.RestoreObject(o)
 	}
-	for _, a := range cs.AutoInc {
-		m.autoMu.Lock()
-		m.auto[a.Table] = &counter{next: a.Next, seeded: true}
-		m.autoMu.Unlock()
-	}
 	m.Seq.Advance(cs.Seq)
 	return nil
-}
-
-// AutoIncrement hands out n values for a table (doc 05 §2.3): seeded once
-// from max(Source AUTO_INCREMENT, highest Delta value) plus the gap (D-15) for
-// mirrored tables, then counted up. Values are never handed out twice, and are
-// not returned on rollback, as in InnoDB.
-func (m *Manager) AutoIncrement(t types.TableID, n uint64, offset, increment uint64) (first, granted uint64, move types.AutoIncMove, err error) {
-	if n == 0 {
-		n = 1
-	}
-	if increment == 0 {
-		increment = 1
-	}
-	m.autoMu.Lock()
-	c := m.auto[t]
-	if c == nil {
-		c = &counter{}
-		m.auto[t] = c
-	}
-	m.autoMu.Unlock()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.seeded {
-		def, ok := m.catalog.Table(t)
-		if !ok {
-			return 0, 0, move, types.Errorf(types.ErrInternal, "auto-increment on unknown table")
-		}
-		var high uint64
-		if col := autoColumn(def); col >= 0 {
-			if tb := m.store.Snapshot().Table(t); tb != nil {
-				for _, r := range tb.Rows() {
-					if col < len(r.Row) && !r.Row[col].Null {
-						if v, err := strconv.ParseUint(string(r.Row[col].B), 10, 64); err == nil && v > high {
-							high = v
-						}
-					}
-				}
-			}
-		}
-		next := high + 1
-		if def.Kind == types.Mirrored && def.Source != nil {
-			src := def.Source.AutoInc
-			if src < 1 {
-				src = 1
-			}
-			if src > next {
-				next = src
-			}
-			next += m.autoGap
-		}
-		c.next, c.seeded = next, true
-	}
-	first = c.next
-	if offset > 1 || increment > 1 {
-		// Align to auto_increment_offset + k * auto_increment_increment.
-		if offset == 0 {
-			offset = 1
-		}
-		if first < offset {
-			first = offset
-		} else if r := (first - offset) % increment; r != 0 {
-			first += increment - r
-		}
-	}
-	c.next = first + n*increment
-	return first, n, types.AutoIncMove{Table: t, Next: c.next}, nil
-}
-
-// SetAutoIncrement moves a table's counter (ALTER TABLE ... AUTO_INCREMENT, restore).
-func (m *Manager) SetAutoIncrement(t types.TableID, next uint64) {
-	m.autoMu.Lock()
-	defer m.autoMu.Unlock()
-	m.auto[t] = &counter{next: next, seeded: true}
-}
-
-func autoColumn(def types.TableDef) int {
-	for i, c := range def.Columns {
-		if c.AutoIncrement {
-			return i
-		}
-	}
-	return -1
 }

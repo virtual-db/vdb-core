@@ -66,9 +66,6 @@ func (m *Merge) Scan(tx *txn.Tx, req types.ScanRequest) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := intervalLocks(tx, d, req); err != nil {
-		return nil, err
-	}
 	h := &Handle{}
 	var sc types.Cursor = &emptyCursor{}
 	if hasSource(d, view) {
@@ -81,7 +78,7 @@ func (m *Merge) Scan(tx *txn.Tx, req types.ScanRequest) (*Handle, error) {
 		if err != nil {
 			return nil, &types.Error{Code: types.ErrSource, Table: d.ID, Msg: err.Error()}
 		}
-		sc = &sourceCursor{m: m, tx: tx, d: d, view: view, sc: cur, cols: req.Columns, lock: req.Lock,
+		sc = &sourceCursor{m: m, tx: tx, d: d, view: view, sc: cur, cols: req.Columns, lock: req.Locks,
 			merged: req.Ordered, dropped: map[string]uint32{}}
 		if view != nil && d.ShadowsNeeded() && view.Len()+int(view.State.TouchedN) > 0 {
 			h.shadows = view.ShadowImages()
@@ -161,7 +158,7 @@ type sourceCursor struct {
 	view    *delta.Table
 	sc      types.SourceCursor
 	cols    types.ColumnSet
-	lock    types.LockMode
+	lock    *types.ReadLocks
 	merged  bool // run vdb.records.merged here (ordered scans)
 	dropped map[string]uint32
 	done    bool
@@ -200,15 +197,15 @@ func (c *sourceCursor) Close() error { return c.sc.Close() }
 // Delta hides. With a lock mode, each kept row is locked and replaced by its
 // latest committed version (product doc 05 §3.2).
 func (m *Merge) filterSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, sr types.SourceRows, cols types.ColumnSet,
-	mode types.LockMode, whole bool, dropped map[string]uint32) (types.Batch, error) {
-	b, _, err := m.filterSourceIdx(tx, d, view, sr, cols, mode, whole, dropped)
+	lk *types.ReadLocks, whole bool, dropped map[string]uint32) (types.Batch, error) {
+	b, _, err := m.filterSourceIdx(tx, d, view, sr, cols, lk, whole, dropped)
 	return b, err
 }
 
 // filterSourceIdx is filterSource that also returns, for each kept row, its
 // position in the Source batch.
 func (m *Merge) filterSourceIdx(tx *txn.Tx, d *types.TableDef, view *delta.Table, sr types.SourceRows, cols types.ColumnSet,
-	mode types.LockMode, whole bool, dropped map[string]uint32) (types.Batch, []int, error) {
+	lk *types.ReadLocks, whole bool, dropped map[string]uint32) (types.Batch, []int, error) {
 	var orig []int
 	rows := sr.Rows
 	if m.hooks.Source != nil {
@@ -252,8 +249,8 @@ func (m *Merge) filterSourceIdx(tx *txn.Tx, d *types.TableDef, view *delta.Table
 		if whole {
 			ref.Whole = row
 		}
-		if mode != types.LockNone {
-			if err := LockRow(tx, d.ID, key, img, mode); err != nil {
+		if lk != nil && lk.Row != nil {
+			if err := lk.Row(d.ID, types.LockKey(key, img)); err != nil {
 				return types.Batch{}, nil, err
 			}
 			if _, touched := tx.Latest(d.ID, nil, key); touched && !whole {
@@ -355,8 +352,8 @@ func (c *deltaCursor) Next(maxRows, maxBytes int) (types.Batch, error) {
 		if !c.inRanges(r) {
 			continue
 		}
-		if c.req.Lock != types.LockNone {
-			if err := LockRow(c.tx, c.d.ID, r.SourceKey, r.Image, c.req.Lock); err != nil {
+		if c.req.Locks != nil && c.req.Locks.Row != nil {
+			if err := c.req.Locks.Row(c.d.ID, types.LockKey(r.SourceKey, r.Image)); err != nil {
 				return types.Batch{}, err
 			}
 			latest, _ := c.tx.Latest(c.d.ID, r.Image, nil)

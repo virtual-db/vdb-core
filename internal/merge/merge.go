@@ -7,7 +7,6 @@ package merge
 
 import (
 	"github.com/virtual-db/vdb-core/internal/delta"
-	"github.com/virtual-db/vdb-core/internal/lock"
 	"github.com/virtual-db/vdb-core/internal/txn"
 	"github.com/virtual-db/vdb-core/internal/types"
 )
@@ -49,23 +48,6 @@ func New(cfg Config, hooks Hooks) *Merge {
 // SetHooks installs the hooks.
 func (m *Merge) SetHooks(h Hooks) { m.hooks = h }
 
-// LockKey is the record-lock key of a row: its Source key bytes when it has
-// them, else its identity image. Both sides of a conflict compute it the same way.
-func LockKey(sk types.SourceKey, img types.KeyImage) types.KeyImage {
-	if len(sk) > 0 {
-		return append(types.KeyImage{'s'}, sk...)
-	}
-	return append(types.KeyImage{'i'}, img...)
-}
-
-// LockRow takes a record lock on a row.
-func LockRow(tx *txn.Tx, t types.TableID, sk types.SourceKey, img types.KeyImage, mode types.LockMode) error {
-	if mode == types.LockNone {
-		return nil
-	}
-	return tx.Lock(lock.Request{Table: t, Kind: lock.Record, Mode: mode, Key: LockKey(sk, img)})
-}
-
 func def(tx *txn.Tx, t types.TableID) (*types.TableDef, error) {
 	d, ok := tx.Def(t)
 	if !ok {
@@ -102,26 +84,6 @@ func deltaRef(r *delta.DeltaRow, whole bool) types.RowRef {
 		ref.Whole = r.Row
 	}
 	return ref
-}
-
-// interval locks every scanned range of a locking scan (next-key locks over
-// the merged index, stored as one interval per range, D-69). An index whose
-// order is not proven gets a whole-index lock (D-64).
-func intervalLocks(tx *txn.Tx, d *types.TableDef, req types.ScanRequest) error {
-	if req.Lock == types.LockNone || !tx.Gaps() {
-		return nil
-	}
-	ix := d.Index(req.Index)
-	ranges := req.Ranges
-	if len(ranges) == 0 || (ix != nil && !ix.OrderProven) {
-		ranges = []types.KeyRange{{}}
-	}
-	for _, r := range ranges {
-		if err := tx.Lock(lock.Request{Table: d.ID, Index: req.Index, Kind: lock.Interval, Mode: req.Lock, Range: r.Images}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func project(rows []types.Row, cols types.ColumnSet) []types.Row {

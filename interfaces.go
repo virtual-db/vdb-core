@@ -32,9 +32,6 @@ type Config struct {
 	MemoryReserve float64 // fraction kept free; 0.10 by default
 	DeltaMaxBytes uint64  // 0 means no fixed cap
 
-	// Writes (product doc 10 §5).
-	AutoIncrementGap uint64 // 1,000,000 by default (D-15)
-
 	// Locks (product doc 07 §5).
 	DefaultLockWait time.Duration // used when a statement sends none
 

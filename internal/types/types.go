@@ -37,7 +37,7 @@ type Value struct {
 // Row is a list of columns in the order the request named them.
 type Row []Value
 
-// Key carries a key's sort image and its raw engine form (MySQL's key format).
+// Key carries a key's sort image and its raw form in the engine's own key format.
 type Key struct {
 	Image KeyImage
 	Raw   []byte
@@ -64,30 +64,33 @@ type RowRef struct {
 
 // ── Requests (doc 03 §3.2) ──
 
-// SessionInfo identifies a mysqld connection.
+// SessionInfo identifies one of the engine's client connections.
 type SessionInfo struct {
 	ConnID  uint64
 	Account string
 	Control bool
 }
 
-// Isolation is a transaction isolation level.
-type Isolation uint8
+// SnapshotScope says how long a snapshot pair lives. The engine maps its
+// isolation levels onto it (implementation plan doc 04 §2, doc 09 §3.3).
+type SnapshotScope uint8
 
 const (
-	RepeatableRead Isolation = iota
-	ReadCommitted
-	ReadUncommitted
-	Serializable
+	// PerTransaction keeps one snapshot pair for the whole transaction.
+	PerTransaction SnapshotScope = iota
+	// PerStatement takes a new snapshot pair for each statement.
+	PerStatement
 )
 
-// LockMode is the row lock a read or write needs.
-type LockMode uint8
+// ReadView says which Delta state a plain read sees (doc 04 §2.3).
+type ReadView uint8
 
 const (
-	LockNone LockMode = iota
-	LockShared
-	LockExclusive
+	// ViewSnapshot is the transaction's own writes over its snapshot.
+	ViewSnapshot ReadView = iota
+	// ViewUncommitted is the current committed state overlaid with every open
+	// transaction's writes.
+	ViewUncommitted
 )
 
 // EvalContext holds the session settings the Source must mirror. Opaque to the core.
@@ -95,15 +98,32 @@ type EvalContext map[string]string
 
 // StmtContext describes the statement that is starting.
 type StmtContext struct {
-	Database         string
-	Isolation        Isolation
-	Autocommit       bool
-	LockIntent       LockMode
-	ForeignKeyChecks bool
-	LockWait         time.Duration
-	Eval             EvalContext
-	ReadOnly         bool
-	Digest           string
+	Database string
+	Snapshot SnapshotScope
+	View     ReadView
+	LockWait time.Duration
+	Eval     EvalContext
+	ReadOnly bool
+	Digest   string
+}
+
+// ReadLocks makes a read a locking read. The engine decides what to lock; the
+// core calls Row for every row the read returns, before it re-reads that
+// row's latest committed version (product doc 05 §3.2), and Missing for every
+// key of a lookup that found nothing. Key is LockKey of the row.
+type ReadLocks struct {
+	Row     func(t TableID, key KeyImage) error
+	Missing func(t TableID, idx IndexID, img KeyImage) error
+}
+
+// LockKey is the lock key of a row: its Source key bytes when it has them,
+// else its identity image. The engine and the core compute it the same way,
+// so both sides of a conflict name the same resource.
+func LockKey(sk SourceKey, img KeyImage) KeyImage {
+	if len(sk) > 0 {
+		return append(KeyImage{'s'}, sk...)
+	}
+	return append(KeyImage{'i'}, img...)
 }
 
 // ImageRange is a range of sort images; an empty bound is open. Bounds are
@@ -144,7 +164,7 @@ type ScanRequest struct {
 	Dir     Direction
 	Columns ColumnSet
 	Pushed  string
-	Lock    LockMode
+	Locks   *ReadLocks // nil for a plain read
 }
 
 // SourceScan is what the core asks the Source adapter to scan (paged, D-84).
@@ -224,9 +244,34 @@ type RowProvider interface {
 	Rows(s SessionInfo, cols ColumnSet) (Cursor, error)
 }
 
-// ImageFunc computes the sort image of every index for rows the core writes
-// itself (foreign-key cascades). Supplied by the engine per call. images[i][idx].
-type ImageFunc func(t TableID, rows []Row) ([][]KeyImage, error)
+// ── Locks (doc 04 §3) ──
+
+// LockMode is a lock mode the engine defines.
+type LockMode uint8
+
+// Resource is what a lock covers: one key image (Point), one range of images
+// (Range), or a whole index (Whole), within (Table, Index).
+type Resource struct {
+	Table TableID
+	Index IndexID
+	Point KeyImage
+	Range *ImageRange
+	Whole bool
+}
+
+// LockModes is the engine's definition of its lock modes. Conflicts is asked
+// only about overlapping resources held by other transactions. Covers reports
+// whether a held lock on the same resource makes a wanted one unnecessary
+// (nil: only the same mode). WaitOnly modes are waited for but not kept.
+type LockModes struct {
+	Names     []string
+	Conflicts func(held, wanted LockMode, heldRes, wantedRes Resource) bool
+	Covers    func(held, wanted LockMode) bool
+	WaitOnly  func(m LockMode) bool
+}
+
+// LockMark is a position in a session's list of held locks.
+type LockMark uint64
 
 // WaitFunc is told the connection id of a lock holder before a call blocks.
 type WaitFunc func(holder uint64)
@@ -239,9 +284,6 @@ type ErrorCode uint16
 const (
 	ErrNone ErrorCode = iota
 	ErrDuplicateKey
-	ErrNoReferencedRow
-	ErrRowIsReferenced
-	ErrFKDepth
 	ErrLockWaitTimeout
 	ErrDeadlock
 	ErrDeltaFull
@@ -253,8 +295,7 @@ const (
 )
 
 var codeNames = map[ErrorCode]string{
-	ErrDuplicateKey: "duplicate key", ErrNoReferencedRow: "no referenced row",
-	ErrRowIsReferenced: "row is referenced", ErrFKDepth: "foreign key cascade too deep",
+	ErrDuplicateKey:    "duplicate key",
 	ErrLockWaitTimeout: "lock wait timeout", ErrDeadlock: "deadlock",
 	ErrDeltaFull: "delta memory limit reached", ErrLockMemory: "lock memory limit reached",
 	ErrRefused: "refused", ErrSource: "source error", ErrKilled: "killed", ErrInternal: "internal error",
@@ -265,12 +306,11 @@ func (c ErrorCode) String() string { return codeNames[c] }
 
 // Error is the one error type the core returns to the engine.
 type Error struct {
-	Code       ErrorCode
-	Table      TableID
-	Index      IndexID
-	Constraint string
-	Holder     uint64
-	Msg        string
+	Code   ErrorCode
+	Table  TableID
+	Index  IndexID
+	Holder uint64
+	Msg    string
 }
 
 func (e *Error) Error() string {
@@ -460,12 +500,6 @@ type TouchChange struct {
 	Whole bool
 }
 
-// AutoIncMove records an auto-increment counter's new next value.
-type AutoIncMove struct {
-	Table TableID
-	Next  uint64
-}
-
 // ChangeSet is what a commit, a captured statement or a Source change adds.
 // Its order is the order of the writes. V is the JSON format version.
 type ChangeSet struct {
@@ -478,7 +512,6 @@ type ChangeSet struct {
 	Replaced []TableID // tables whose Delta rows were replaced by an ALTER's conversion
 	Catalog  []CatalogChange
 	Objects  []Object
-	AutoInc  []AutoIncMove
 }
 
 // AsErrorOrNil is AsError that returns a nil error interface for nil.

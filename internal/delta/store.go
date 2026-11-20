@@ -195,7 +195,7 @@ func applyOp(tables map[types.TableID]*Table, copied map[types.TableID]bool, op 
 
 // Draft is a transaction's copy-on-write view of the Delta: its own writes
 // over the root it forked from. Used by one goroutine at a time; the owning
-// transaction guards it for READ UNCOMMITTED readers.
+// transaction guards it for uncommitted-view readers.
 type Draft struct {
 	base   *Root
 	tables map[types.TableID]*Table
@@ -208,7 +208,7 @@ func (r *Root) Fork() *Draft {
 	return &Draft{base: r, tables: map[types.TableID]*Table{}, copied: map[types.TableID]bool{}}
 }
 
-// Rebase returns a draft over r holding the same ops (used at READ COMMITTED
+// Rebase returns a draft over r holding the same ops (used with a per-statement snapshot scope
 // to see the latest committed state under the transaction's own writes).
 func (d *Draft) Rebase(r *Root) (*Draft, error) {
 	nd := r.Fork()

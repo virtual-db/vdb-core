@@ -1,7 +1,7 @@
 // Package catalog is the catalog of record (implementation plan doc 06 §1):
 // every table with its kind, definition, version, indexes and foreign keys,
 // every client and Source object in commit order, and the providers of
-// provided tables. The engine's mysqld is rebuilt from it at every start.
+// provided tables. The engine rebuilds its own server's objects from it at every start.
 //
 // Catalog is shared by every session and guarded by one RWMutex.
 package catalog

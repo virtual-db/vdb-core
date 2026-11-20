@@ -1,6 +1,6 @@
 // Package session holds per-session state (implementation plan doc 04 §4):
 // the session's identity, its open transaction, its open scans and its kill
-// flag, and the registry of sessions by mysqld connection id. Session
+// flag, and the registry of sessions by the engine's connection id. Session
 // implements types.Session by calling txn, merge and write, and runs the
 // transaction and write pipelines through a Runner.
 package session
@@ -35,7 +35,7 @@ type Deps struct {
 	DefaultLockWait time.Duration
 }
 
-// Registry maps mysqld connection ids to sessions. Safe for concurrent use.
+// Registry maps the engine's connection ids to sessions. Safe for concurrent use.
 type Registry struct {
 	mu       sync.Mutex
 	sessions map[uint64]*Session
@@ -106,7 +106,7 @@ func (r *Registry) remove(s *Session) {
 	r.mu.Unlock()
 }
 
-// Session is one mysqld connection's state.
+// Session is one client connection's state.
 type Session struct {
 	reg    *Registry
 	info   types.SessionInfo
@@ -116,8 +116,6 @@ type Session struct {
 	killMu sync.Mutex
 	kill   chan struct{}
 	killed atomic.Bool
-	wait   types.WaitFunc
-	images types.ImageFunc
 	ended  bool
 
 	alterRefs []types.RowRef
@@ -158,14 +156,6 @@ func (s *Session) checkKilled() error {
 	return nil
 }
 
-// SetCallbacks installs the wait and image callbacks for the next call.
-func (s *Session) SetCallbacks(wait types.WaitFunc, images types.ImageFunc) {
-	s.wait, s.images = wait, images
-	if s.tx != nil {
-		s.tx.OnWait, s.tx.Images = wait, images
-	}
-}
-
 func (s *Session) deps() Deps { return s.reg.deps }
 
 // StmtBegin starts a statement, opening a transaction when none is open.
@@ -184,13 +174,13 @@ func (s *Session) StmtBegin(ctx types.StmtContext) error {
 	if s.tx == nil || s.tx.Done() {
 		s.tx = s.deps().Txn.Begin(s.info, ctx)
 		if _, err := s.deps().Runner.Process(points.PipelineTransactionBegin, payloads.TransactionBeginPayload{
-			ConnectionID: s.info.ConnID, ReadOnly: ctx.ReadOnly, Isolation: ctx.Isolation}); err != nil {
+			ConnectionID: s.info.ConnID, ReadOnly: ctx.ReadOnly}); err != nil {
 			s.tx.Rollback()
 			s.tx = nil
 			return types.AsError(err)
 		}
 	}
-	s.tx.Killed, s.tx.OnWait, s.tx.Images = kill, s.wait, s.images
+	s.tx.Killed = kill
 	s.tx.Begin(ctx)
 	return nil
 }
@@ -225,7 +215,7 @@ func (s *Session) StmtRollback() error {
 	return types.AsErrorOrNil(s.tx.StmtRollback())
 }
 
-// Snapshot takes the snapshot pair now (START TRANSACTION WITH CONSISTENT SNAPSHOT).
+// Snapshot takes the snapshot pair now.
 func (s *Session) Snapshot() error {
 	tx, err := s.needTx()
 	if err != nil {
@@ -325,16 +315,51 @@ func (s *Session) closeScans() {
 }
 
 // Lookup answers keys; the second result is the shadow set for Source rows.
-func (s *Session) Lookup(t types.TableID, idx types.IndexID, keys []types.Key, cols types.ColumnSet, mode types.LockMode) (types.Batch, []types.KeyImage, error) {
+func (s *Session) Lookup(t types.TableID, idx types.IndexID, keys []types.Key, cols types.ColumnSet, lk *types.ReadLocks) (types.Batch, []types.KeyImage, error) {
 	tx, err := s.needTx()
 	if err != nil {
 		return types.Batch{}, nil, err
 	}
-	r, err := s.deps().Merge.Lookup(tx, t, idx, keys, cols, mode)
+	r, err := s.deps().Merge.Lookup(tx, t, idx, keys, cols, lk)
 	if err != nil {
 		return types.Batch{}, nil, types.AsError(err)
 	}
 	return r.Batch, r.Shadows, nil
+}
+
+// ByColumns reads the merged rows whose columns equal values.
+func (s *Session) ByColumns(t types.TableID, idx types.IndexID, img types.KeyImage, cols types.ColumnSet, values types.Row, want types.ColumnSet, lk *types.ReadLocks) (types.Batch, error) {
+	tx, err := s.needTx()
+	if err != nil {
+		return types.Batch{}, err
+	}
+	b, err := s.deps().Merge.ByColumns(tx, t, idx, img, cols, values, want, lk)
+	return b, types.AsErrorOrNil(err)
+}
+
+// LockMark returns the position in the session's lock list.
+func (s *Session) LockMark() types.LockMark {
+	if s.tx == nil || s.tx.Done() {
+		return 0
+	}
+	return s.deps().Txn.Locks().Mark(s.tx.ID)
+}
+
+// Lock takes a lock for the session's transaction, opening one if needed.
+func (s *Session) Lock(r types.Resource, mode types.LockMode, wait types.WaitFunc) error {
+	tx, err := s.needTx()
+	if err != nil {
+		return err
+	}
+	return types.AsErrorOrNil(tx.Lock(r, mode, wait))
+}
+
+// TxID returns the open transaction's id, or 0.
+func (s *Session) TxID() uint64 {
+	if s.tx == nil || s.tx.Done() {
+		return 0
+	}
+	return s.tx.ID
 }
 
 // Count returns the exact row count.
@@ -430,20 +455,6 @@ func (s *Session) Truncate(t types.TableID) error {
 	return types.AsErrorOrNil(err)
 }
 
-// AutoIncrement hands out a block of values.
-func (s *Session) AutoIncrement(t types.TableID, n uint64) (uint64, uint64, error) {
-	tx, err := s.needTx()
-	if err != nil {
-		return 0, 0, err
-	}
-	first, granted, mv, err := s.deps().Txn.AutoIncrement(t, n, 1, 1)
-	if err != nil {
-		return 0, 0, types.AsError(err)
-	}
-	tx.AutoInc = append(tx.AutoInc, mv)
-	return first, granted, nil
-}
-
 // ApplyDDL stages a client DDL change.
 func (s *Session) ApplyDDL(c types.CatalogChange) (types.TableID, error) {
 	c.Source = false
@@ -497,16 +508,6 @@ func (s *Session) stage(c types.CatalogChange) (types.TableID, error) {
 			c.Table.Source = cur.Source
 		}
 		c.Table.Version = cur.Version + 1
-		if c.Local != nil && c.Local.Kind == types.AddForeignKey && tx.Ctx.ForeignKeyChecks {
-			for _, f := range c.Table.ForeignKeys {
-				if f.Name == c.Local.Object {
-					tmp := c.Table
-					if err := s.deps().Write.FK().ValidateExisting(tx, &tmp, f); err != nil {
-						return 0, types.AsError(err)
-					}
-				}
-			}
-		}
 		if err := tx.Apply(delta.Op{Kind: delta.OpSetVersion, Table: c.ID, TKind: cur.Kind, Version: c.Table.Version}); err != nil {
 			return 0, types.AsError(err)
 		}
@@ -517,8 +518,8 @@ func (s *Session) stage(c types.CatalogChange) (types.TableID, error) {
 	return c.ID, nil
 }
 
-// AlterRows returns every Delta row of a table, in the draft's view, for an
-// ALTER that converts them in vdb.so.
+// AlterRows returns every Delta row of a table, in the draft's view, for a
+// definition change whose rows the engine converts.
 func (s *Session) AlterRows(t types.TableID) types.Cursor {
 	tx, err := s.needTx()
 	if err != nil {

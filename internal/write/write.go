@@ -1,7 +1,8 @@
 // Package write implements writes into a transaction's draft (implementation
 // plan doc 05 §2, product doc 10): inserts with uniqueness checks against the
-// Delta and the Source, updates, deletes, truncate, refusals, foreign-key
-// checks through package fk, and the memory check on every growing change.
+// Delta and the Source, updates, deletes, truncate, refusals, and the memory
+// check on every growing change. The engine has already taken the locks each
+// write needs and run its foreign-key rules (doc 03 §5).
 package write
 
 import (
@@ -12,8 +13,6 @@ import (
 	"time"
 
 	"github.com/virtual-db/vdb-core/internal/delta"
-	"github.com/virtual-db/vdb-core/internal/fk"
-	"github.com/virtual-db/vdb-core/internal/lock"
 	"github.com/virtual-db/vdb-core/internal/merge"
 	"github.com/virtual-db/vdb-core/internal/txn"
 	"github.com/virtual-db/vdb-core/internal/types"
@@ -27,7 +26,6 @@ type Reserver interface {
 // Writer performs writes. One per environment; safe for concurrent use.
 type Writer struct {
 	mem Reserver
-	fk  *fk.Checker
 }
 
 // rowIDs hands out synthetic identities for Delta rows of tables without a
@@ -44,14 +42,9 @@ func syntheticImage() types.KeyImage {
 }
 
 // New returns a Writer.
-func New(mem Reserver, m *merge.Merge) *Writer {
-	w := &Writer{mem: mem}
-	w.fk = &fk.Checker{W: w, Merge: m}
-	return w
+func New(mem Reserver, _ *merge.Merge) *Writer {
+	return &Writer{mem: mem}
 }
-
-// FK returns the foreign-key checker.
-func (w *Writer) FK() *fk.Checker { return w.fk }
 
 func def(tx *txn.Tx, t types.TableID) (*types.TableDef, error) {
 	d, ok := tx.Def(t)
@@ -73,11 +66,6 @@ func imageAt(images []types.KeyImage, id types.IndexID) types.KeyImage {
 		return images[id]
 	}
 	return nil
-}
-
-func uniqueLockKey(idx types.IndexID, img types.KeyImage) types.KeyImage {
-	k := types.KeyImage{'u', byte(idx >> 8), byte(idx)}
-	return append(k, img...)
 }
 
 func nullIn(row types.Row, cols []uint16) bool {
@@ -107,8 +95,8 @@ func (w *Writer) reserve(n int) error {
 }
 
 // Insert inserts rows. images[i] holds the sort image of every index of row
-// i, by IndexID. Results are per row, in order, so mysqld sees each duplicate
-// at the row where it occurs.
+// i, by IndexID. Results are per row, in order, so the engine can report each
+// duplicate at the row where it occurs.
 func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images [][]types.KeyImage) ([]types.WriteResult, error) {
 	d, err := def(tx, t)
 	if err != nil {
@@ -169,7 +157,7 @@ func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images []
 		if i < len(images) {
 			ims = images[i]
 		}
-		if e := w.insertOne(tx, d, row, ims, srcDup[i], 0); e != nil {
+		if e := w.insertOne(tx, d, row, ims, srcDup[i]); e != nil {
 			ce := types.AsError(e)
 			if ce.Code == types.ErrLockWaitTimeout || ce.Code == types.ErrDeadlock || ce.Code == types.ErrKilled ||
 				ce.Code == types.ErrSource || ce.Code == types.ErrInternal || ce.Code == types.ErrLockMemory {
@@ -184,7 +172,7 @@ func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images []
 	return results, nil
 }
 
-func (w *Writer) insertOne(tx *txn.Tx, d *types.TableDef, row types.Row, ims []types.KeyImage, srcDup bool, depth int) error {
+func (w *Writer) insertOne(tx *txn.Tx, d *types.TableDef, row types.Row, ims []types.KeyImage, srcDup bool) error {
 	t := d.ID
 	whole := d.Identity == types.WholeRow
 	var pk types.KeyImage
@@ -196,46 +184,8 @@ func (w *Writer) insertOne(tx *txn.Tx, d *types.TableDef, row types.Row, ims []t
 			return &types.Error{Code: types.ErrInternal, Table: t, Msg: "insert without an identity key image"}
 		}
 	}
-	// Locks: insert intention and a record lock on every unique key (D-64).
-	for _, ix := range d.Indexes {
-		if !(ix.Unique || ix.Primary) {
-			continue
-		}
-		img := imageAt(ims, ix.ID)
-		if img == nil || nullIn(row, ix.Columns) {
-			continue
-		}
-		if err := tx.Lock(lock.Request{Table: t, Index: ix.ID, Kind: lock.InsertIntention, Mode: types.LockExclusive, Key: img}); err != nil {
-			return err
-		}
-		key := uniqueLockKey(ix.ID, img)
-		if ix.ID == d.Identity && !whole {
-			key = merge.LockKey(nil, img)
-		}
-		if err := tx.Lock(lock.Request{Table: t, Kind: lock.Record, Mode: types.LockExclusive, Key: key}); err != nil {
-			return err
-		}
-	}
-	// Non-unique indexes still wait for gap locks covering the new entry.
-	for _, ix := range d.Indexes {
-		if ix.Unique || ix.Primary {
-			continue
-		}
-		if img := imageAt(ims, ix.ID); img != nil {
-			if err := tx.Lock(lock.Request{Table: t, Index: ix.ID, Kind: lock.InsertIntention, Mode: types.LockExclusive, Key: img}); err != nil {
-				return err
-			}
-		}
-	}
 	if err := w.checkUnique(tx, d, row, ims, nil, nil, srcDup); err != nil {
 		return err
-	}
-	if tx.Ctx.ForeignKeyChecks {
-		for _, f := range d.ForeignKeys {
-			if err := w.fk.CheckParent(tx, d, f, row, ims); err != nil {
-				return err
-			}
-		}
 	}
 	dr := &delta.DeltaRow{Image: pk, Row: types.CloneRow(row), Origin: types.OriginDelta, Images: cloneImages(ims, pk, d)}
 	if err := w.reserve(types.RowSize(row) + 64*len(ims)); err != nil {
@@ -382,7 +332,7 @@ func equalityProven(d *types.TableDef) bool {
 
 func refusedCollation(d *types.TableDef) error {
 	return &types.Error{Code: types.ErrRefused, Table: d.ID,
-		Msg: "table " + d.Database + "." + d.Name + " has a primary key in a collation not proven for equality; updates and deletes of Source rows are refused (D-62)"}
+		Msg: "table " + d.Database + "." + d.Name + " has an identity key not proven for equality; updates and deletes of Source rows are refused (D-62)"}
 }
 
 // oldRowOf returns the full old row: the Delta row's, or the one the engine
@@ -403,11 +353,6 @@ func oldRowOf(tx *txn.Tx, t types.TableID, old types.RowRef) (*delta.DeltaRow, t
 
 // Update replaces a row (doc 05 §2.2).
 func (w *Writer) Update(tx *txn.Tx, t types.TableID, old types.RowRef, row types.Row, images []types.KeyImage) error {
-	return w.UpdateRow(tx, t, old, nil, row, images, 0)
-}
-
-// UpdateRow is Update with the old row known (cascades) and a cascade depth.
-func (w *Writer) UpdateRow(tx *txn.Tx, t types.TableID, old types.RowRef, oldRow, row types.Row, images []types.KeyImage, depth int) error {
 	d, err := def(tx, t)
 	if err != nil {
 		return err
@@ -416,13 +361,7 @@ func (w *Writer) UpdateRow(tx *txn.Tx, t types.TableID, old types.RowRef, oldRow
 	if old.Origin == types.OriginSource && !equalityProven(d) {
 		return refusedCollation(d)
 	}
-	if err := merge.LockRow(tx, t, old.SourceKey, old.PK.Image, types.LockExclusive); err != nil {
-		return err
-	}
-	prev, prevRow := oldRowOf(tx, t, old)
-	if oldRow == nil {
-		oldRow = prevRow
-	}
+	prev, _ := oldRowOf(tx, t, old)
 	var newImg types.KeyImage
 	if whole {
 		if prev != nil {
@@ -440,32 +379,8 @@ func (w *Writer) UpdateRow(tx *txn.Tx, t types.TableID, old types.RowRef, oldRow
 	if prev != nil {
 		selfImg = prev.Image
 	}
-	if !whole && !bytes.Equal(newImg, selfImg) {
-		if err := merge.LockRow(tx, t, nil, newImg, types.LockExclusive); err != nil {
-			return err
-		}
-	}
 	if err := w.checkUnique(tx, d, row, images, selfImg, old.SourceKey, false); err != nil {
 		return err
-	}
-	if tx.Ctx.ForeignKeyChecks || depth > 0 {
-		for _, f := range d.ForeignKeys {
-			if oldRow != nil {
-				ov, _ := valuesOf(oldRow, f.Columns)
-				nv, _ := valuesOf(row, f.Columns)
-				if sameValues(ov, nv) {
-					continue
-				}
-			}
-			if err := w.fk.CheckParent(tx, d, f, row, images); err != nil {
-				return err
-			}
-		}
-		if oldRow != nil {
-			if err := w.fk.OnParentChange(tx, d, oldRow, row, depth); err != nil {
-				return err
-			}
-		}
 	}
 	if err := w.reserve(types.RowSize(row) + 64*len(images)); err != nil {
 		return err
@@ -492,32 +407,8 @@ func (w *Writer) UpdateRow(tx *txn.Tx, t types.TableID, old types.RowRef, oldRow
 	return tx.Apply(delta.Op{Kind: delta.OpPutRow, Table: t, Row: nr, TKind: d.Kind, Version: d.Version})
 }
 
-func valuesOf(row types.Row, cols []uint16) ([]types.Value, bool) {
-	if row == nil {
-		return nil, false
-	}
-	return project(row, cols), true
-}
-
-func sameValues(a, b []types.Value) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Null != b[i].Null || !bytes.Equal(a[i].B, b[i].B) {
-			return false
-		}
-	}
-	return true
-}
-
 // Delete removes a row (doc 05 §2.2).
 func (w *Writer) Delete(tx *txn.Tx, t types.TableID, old types.RowRef) error {
-	return w.DeleteRow(tx, t, old, nil, 0)
-}
-
-// DeleteRow is Delete with the old row known (cascades) and a cascade depth.
-func (w *Writer) DeleteRow(tx *txn.Tx, t types.TableID, old types.RowRef, oldRow types.Row, depth int) error {
 	d, err := def(tx, t)
 	if err != nil {
 		return err
@@ -526,18 +417,7 @@ func (w *Writer) DeleteRow(tx *txn.Tx, t types.TableID, old types.RowRef, oldRow
 	if old.Origin == types.OriginSource && !equalityProven(d) {
 		return refusedCollation(d)
 	}
-	if err := merge.LockRow(tx, t, old.SourceKey, old.PK.Image, types.LockExclusive); err != nil {
-		return err
-	}
-	prev, prevRow := oldRowOf(tx, t, old)
-	if oldRow == nil {
-		oldRow = prevRow
-	}
-	if (tx.Ctx.ForeignKeyChecks || depth > 0) && oldRow != nil {
-		if err := w.fk.OnParentChange(tx, d, oldRow, nil, depth); err != nil {
-			return err
-		}
-	}
+	prev, _ := oldRowOf(tx, t, old)
 	if old.Origin == types.OriginSource {
 		touch := delta.Op{Kind: delta.OpTouch, Table: t, Key: old.SourceKey, Image: old.PK.Image, Whole: whole, Delta: 1, TKind: d.Kind, Version: d.Version}
 		if whole {

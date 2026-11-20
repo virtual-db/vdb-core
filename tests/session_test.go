@@ -193,28 +193,30 @@ func (e *env) session(conn uint64) core.Session {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	s.SetCallbacks(nil, func(t core.TableID, rows []core.Row) ([][]core.KeyImage, error) {
-		out := make([][]core.KeyImage, len(rows))
-		for i, r := range rows {
-			id, _ := strconv.Atoi(string(r[0].B))
-			ims := []core.KeyImage{img(id)}
-			if t == e.orders && !r[1].Null {
-				u, _ := strconv.Atoi(string(r[1].B))
-				ims = append(ims, img(u))
-			} else if t == e.orders {
-				ims = append(ims, []byte{0})
-			}
-			out[i] = ims
-		}
-		return out, nil
-	})
 	return s
 }
 
-func stmt(t *testing.T, s core.Session, iso core.Isolation) {
-	if err := s.StmtBegin(core.StmtContext{Isolation: iso, ForeignKeyChecks: true}); err != nil {
+func stmt(t *testing.T, s core.Session, scope core.SnapshotScope) {
+	if err := s.StmtBegin(core.StmtContext{Snapshot: scope}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Test lock modes: shared and exclusive, as an engine would define them.
+const (
+	lockS core.LockMode = iota
+	lockX
+)
+
+func (e *env) defineLocks() {
+	e.api.Locks().Define(core.LockModes{Names: []string{"S", "X"},
+		Conflicts: func(h, w core.LockMode, _, _ core.Resource) bool { return h == lockX || w == lockX },
+		Covers:    func(h, w core.LockMode) bool { return h == lockX || h == w }})
+}
+
+// lockRow takes the engine's exclusive lock on a row before it writes it.
+func (e *env) lockRow(s core.Session, ref core.RowRef) error {
+	return e.api.Locks().Acquire(s, core.Resource{Table: e.users, Point: core.LockKey(ref.SourceKey, ref.PK.Image)}, lockX, nil)
 }
 
 func scanAll(t *testing.T, s core.Session, tab core.TableID) []string {
@@ -263,7 +265,7 @@ func srcRef(id int) core.RowRef {
 func TestMergeRuleAndCount(t *testing.T) {
 	e := newEnv(t)
 	s := e.session(1)
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	if _, err := s.Insert(e.users, []core.Row{row(4, "dan")}, [][]core.KeyImage{images(4)}); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +280,7 @@ func TestMergeRuleAndCount(t *testing.T) {
 	if err != nil || declined || n != 3 {
 		t.Fatalf("count = %d %v %v", n, declined, err)
 	}
-	b, _, err := s.Lookup(e.users, 0, []core.Key{{Image: img(1)}, {Image: img(2)}, {Image: img(3)}, {Image: img(4)}}, core.ColumnSet{1}, core.LockNone)
+	b, _, err := s.Lookup(e.users, 0, []core.Key{{Image: img(1)}, {Image: img(2)}, {Image: img(3)}, {Image: img(4)}}, core.ColumnSet{1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,14 +293,14 @@ func TestMergeRuleAndCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2 := e.session(2)
-	stmt(t, s2, core.RepeatableRead)
+	stmt(t, s2, core.PerTransaction)
 	equal(t, scanAll(t, s2, e.users), "1:ann", "2:bobby", "4:dan")
 }
 
 func TestDuplicates(t *testing.T) {
 	e := newEnv(t)
 	s := e.session(1)
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	res, err := s.Insert(e.users, []core.Row{row(5, "x"), row(1, "dup-source"), row(5, "dup-delta")},
 		[][]core.KeyImage{images(5), images(1), images(5)})
 	if err != nil {
@@ -320,40 +322,44 @@ func TestDuplicates(t *testing.T) {
 func TestSavepointsAndStatementRollback(t *testing.T) {
 	e := newEnv(t)
 	s := e.session(1)
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	s.Insert(e.users, []core.Row{row(6, "a")}, [][]core.KeyImage{images(6)})
 	s.StmtEnd()
 	s.Savepoint("sp1")
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	s.Insert(e.users, []core.Row{row(7, "b")}, [][]core.KeyImage{images(7)})
 	s.StmtEnd()
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	s.Insert(e.users, []core.Row{row(8, "c")}, [][]core.KeyImage{images(8)})
 	if err := s.StmtRollback(); err != nil {
 		t.Fatal(err)
 	}
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	equal(t, scanAll(t, s, e.users), "1:ann", "2:bob", "3:cid", "6:a", "7:b")
 	if err := s.RollbackTo("sp1"); err != nil {
 		t.Fatal(err)
 	}
 	equal(t, scanAll(t, s, e.users), "1:ann", "2:bob", "3:cid", "6:a")
 	s.Rollback()
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	equal(t, scanAll(t, s, e.users), "1:ann", "2:bob", "3:cid")
 }
 
 func TestIsolationAndLocks(t *testing.T) {
 	e := newEnv(t)
 	a, b := e.session(1), e.session(2)
-	stmt(t, a, core.RepeatableRead)
-	stmt(t, b, core.RepeatableRead)
+	e.defineLocks()
+	stmt(t, a, core.PerTransaction)
+	stmt(t, b, core.PerTransaction)
 	equal(t, scanAll(t, b, e.users), "1:ann", "2:bob", "3:cid") // b's snapshot
+	if err := e.lockRow(a, srcRef(1)); err != nil {
+		t.Fatal(err)
+	}
 	if err := a.Update(e.users, srcRef(1), row(1, "anna"), images(1)); err != nil {
 		t.Fatal(err)
 	}
 	// b waits on a's row lock and times out.
-	err := b.Update(e.users, srcRef(1), row(1, "annie"), images(1))
+	err := e.lockRow(b, srcRef(1))
 	var ce *core.Error
 	if !errors.As(err, &ce) || ce.Code != core.ErrLockWaitTimeout {
 		t.Fatalf("want lock wait timeout, got %v", err)
@@ -361,28 +367,29 @@ func TestIsolationAndLocks(t *testing.T) {
 	if err := a.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	// b still sees its snapshot at REPEATABLE READ.
+	// b still sees its snapshot with a per-transaction scope.
 	equal(t, scanAll(t, b, e.users), "1:ann", "2:bob", "3:cid")
 	b.Rollback()
-	stmt(t, b, core.ReadCommitted)
+	stmt(t, b, core.PerStatement)
 	equal(t, scanAll(t, b, e.users), "1:anna", "2:bob", "3:cid")
 }
 
 func TestDeadlock(t *testing.T) {
 	e := newEnv(t)
 	a, b := e.session(1), e.session(2)
-	stmt(t, a, core.RepeatableRead)
-	stmt(t, b, core.RepeatableRead)
-	if err := a.Update(e.users, srcRef(1), row(1, "a1"), images(1)); err != nil {
+	e.defineLocks()
+	stmt(t, a, core.PerTransaction)
+	stmt(t, b, core.PerTransaction)
+	if err := e.lockRow(a, srcRef(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Update(e.users, srcRef(2), row(2, "b2"), images(2)); err != nil {
+	if err := e.lockRow(b, srcRef(2)); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- a.Update(e.users, srcRef(2), row(2, "a2"), images(2)) }()
+	go func() { done <- e.lockRow(a, srcRef(2)) }()
 	time.Sleep(50 * time.Millisecond)
-	errB := b.Update(e.users, srcRef(1), row(1, "b1"), images(1))
+	errB := e.lockRow(b, srcRef(1))
 	var ce *core.Error
 	if !errors.As(errB, &ce) || ce.Code != core.ErrDeadlock {
 		t.Fatalf("want deadlock for the younger transaction, got %v", errB)
@@ -396,7 +403,7 @@ func TestDeadlock(t *testing.T) {
 func TestTruncateDetaches(t *testing.T) {
 	e := newEnv(t)
 	s := e.session(1)
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	if err := s.Truncate(e.users); err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +411,7 @@ func TestTruncateDetaches(t *testing.T) {
 	if err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	stmt(t, s, core.RepeatableRead)
+	stmt(t, s, core.PerTransaction)
 	equal(t, scanAll(t, s, e.users), "9:z")
 	d, _ := e.api.Catalog().Table(e.users)
 	if d.Kind != core.Detached {
@@ -412,28 +419,26 @@ func TestTruncateDetaches(t *testing.T) {
 	}
 }
 
-func TestForeignKeys(t *testing.T) {
+func TestByColumns(t *testing.T) {
 	e := newEnv(t)
 	s := e.session(1)
-	stmt(t, s, core.RepeatableRead)
-	// Child with a missing parent.
-	res, err := s.Insert(e.orders, []core.Row{row(20, "99")}, [][]core.KeyImage{{img(20), img(99)}})
+	stmt(t, s, core.PerTransaction)
+	// A Delta child of user 3, then the children of user 1 and of user 3.
+	if res, err := s.Insert(e.orders, []core.Row{row(21, "3")}, [][]core.KeyImage{{img(21), img(3)}}); err != nil || res[0].Err != nil {
+		t.Fatalf("insert: %v %v", err, res)
+	}
+	b, err := s.ByColumns(e.orders, 1, img(1), core.ColumnSet{1}, core.Row{{B: []byte("1")}}, core.ColumnSet{0, 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res[0].Err == nil || res[0].Err.Code != core.ErrNoReferencedRow {
-		t.Fatalf("want no referenced row, got %+v", res[0].Err)
+	if len(b.Rows) != 2 {
+		t.Fatalf("children of user 1: %d rows, want 2 (Source rows 10 and 11)", len(b.Rows))
 	}
-	// Child with a Source parent.
-	res, _ = s.Insert(e.orders, []core.Row{row(21, "3")}, [][]core.KeyImage{{img(21), img(3)}})
-	if res[0].Err != nil {
-		t.Fatalf("insert child: %v", res[0].Err)
-	}
-	// ON DELETE CASCADE removes Source children 10 and 11 of user 1.
-	old := srcRef(1)
-	old.Whole = row(1, "ann")
-	if err := s.Delete(e.users, old); err != nil {
+	b, err = s.ByColumns(e.orders, 1, img(3), core.ColumnSet{1}, core.Row{{B: []byte("3")}}, core.ColumnSet{0, 1}, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	equal(t, scanAll(t, s, e.orders), "12:2", "21:3")
+	if len(b.Rows) != 1 || string(b.Rows[0][0].B) != "21" {
+		t.Fatalf("children of user 3: %v, want the Delta row 21", b.Rows)
+	}
 }

@@ -15,19 +15,17 @@ import (
 )
 
 type savepoint struct {
-	name  string // empty for the statement savepoint
-	mark  delta.Mark
-	ddl   int
-	locks int
+	name string // empty for the statement savepoint
+	mark delta.Mark
+	ddl  int
 }
 
 // Tx is one transaction. Used by one goroutine at a time; mu guards the draft
-// for READ UNCOMMITTED readers in other sessions.
+// for uncommitted-view readers in other sessions.
 type Tx struct {
 	m        *Manager
 	ID       uint64
 	Info     types.SessionInfo
-	Iso      types.Isolation
 	ReadOnly bool
 	Ctx      types.StmtContext
 
@@ -41,25 +39,15 @@ type Tx struct {
 	stmt       *savepoint
 	savepoints []savepoint
 	ddl        []types.CatalogChange
-	// AutoInc records counter moves for the change set.
-	AutoInc  []types.AutoIncMove
-	lockLog  []lockKey
-	own      map[types.TableID]map[string]bool // identity images this tx wrote
-	ownTouch map[types.TableID]map[string]bool // Source keys this tx touched
+	own        map[types.TableID]map[string]bool // identity images this tx wrote
+	ownTouch   map[types.TableID]map[string]bool // Source keys this tx touched
 
 	// LookupCache answers keys already asked inside one Source snapshot (D-68).
 	// It holds Source rows only and is dropped with the snapshot.
 	LookupCache map[string]CachedLookup
 
 	Killed <-chan struct{}
-	OnWait types.WaitFunc
-	Images types.ImageFunc
 	done   bool
-}
-
-type lockKey struct {
-	table types.TableID
-	key   string
 }
 
 // Manager returns the transaction's manager.
@@ -68,7 +56,7 @@ func (tx *Tx) Manager() *Manager { return tx.m }
 // Begin pushes the statement savepoint and records the statement's context.
 func (tx *Tx) Begin(ctx types.StmtContext) {
 	tx.Ctx = ctx
-	sp := savepoint{mark: tx.mark(), ddl: len(tx.ddl), locks: len(tx.lockLog)}
+	sp := savepoint{mark: tx.mark(), ddl: len(tx.ddl)}
 	tx.stmt = &sp
 }
 
@@ -79,18 +67,17 @@ func (tx *Tx) mark() delta.Mark {
 	return tx.draft.Mark()
 }
 
-// End pops the statement savepoint. At READ COMMITTED the snapshot pair is
-// dropped so the next statement sees the latest committed state.
+// End pops the statement savepoint. With a per-statement snapshot scope the
+// snapshot pair is dropped so the next statement sees the latest committed state.
 func (tx *Tx) End() {
 	tx.stmt = nil
-	if tx.Iso == types.ReadCommitted || tx.Iso == types.ReadUncommitted {
+	if tx.Ctx.Snapshot == types.PerStatement {
 		tx.dropPair()
-		tx.m.locks.ReleaseGaps(tx.ID)
 	}
 }
 
-// StmtRollback undoes the statement. Locks taken by it are released only at
-// READ COMMITTED, as InnoDB does.
+// StmtRollback undoes the statement. It releases no lock: whether the
+// statement's locks go too is the engine's rule (Locks.ReleaseSince).
 func (tx *Tx) StmtRollback() error {
 	if tx.stmt == nil {
 		return nil
@@ -98,14 +85,6 @@ func (tx *Tx) StmtRollback() error {
 	sp := *tx.stmt
 	if err := tx.restore(sp); err != nil {
 		return err
-	}
-	if tx.Iso == types.ReadCommitted || tx.Iso == types.ReadUncommitted {
-		dropped := map[lockKey]bool{}
-		for _, k := range tx.lockLog[sp.locks:] {
-			dropped[k] = true
-		}
-		tx.m.locks.ReleaseIf(tx.ID, func(t types.TableID, key types.KeyImage) bool { return dropped[lockKey{t, string(key)}] })
-		tx.lockLog = tx.lockLog[:sp.locks]
 	}
 	tx.stmt = nil
 	return nil
@@ -159,7 +138,7 @@ func (tx *Tx) noteOwn(op delta.Op) {
 // Savepoint pushes a named savepoint, replacing one of the same name.
 func (tx *Tx) Savepoint(name string) {
 	tx.Release(name)
-	tx.savepoints = append(tx.savepoints, savepoint{name: name, mark: tx.mark(), ddl: len(tx.ddl), locks: len(tx.lockLog)})
+	tx.savepoints = append(tx.savepoints, savepoint{name: name, mark: tx.mark(), ddl: len(tx.ddl)})
 }
 
 // RollbackTo undoes to a named savepoint and drops later ones.
@@ -262,13 +241,13 @@ func (tx *Tx) Source() (types.SourceSnapshot, error) {
 }
 
 // View returns the transaction's view of a table's Delta: its own writes over
-// its snapshot. At READ UNCOMMITTED it is the current committed state overlaid
-// with every open transaction's writes (D-63). Nil means no Delta rows.
+// its snapshot; with the uncommitted read view, the current committed state
+// overlaid with every open transaction's writes. Nil means no Delta rows.
 func (tx *Tx) View(t types.TableID) (*delta.Table, error) {
 	if err := tx.TakePair(false); err != nil {
 		return nil, err
 	}
-	if tx.Iso == types.ReadUncommitted {
+	if tx.Ctx.View == types.ViewUncommitted {
 		return tx.m.uncommitted(tx, t)
 	}
 	tx.mu.Lock()
@@ -338,22 +317,10 @@ func (tx *Tx) Stage(c types.CatalogChange) { tx.ddl = append(tx.ddl, c) }
 // Staged returns the staged DDL changes.
 func (tx *Tx) Staged() []types.CatalogChange { return tx.ddl }
 
-// Lock takes a lock for this transaction and logs record locks for
-// statement rollback.
-func (tx *Tx) Lock(r lock.Request) error {
-	w := lock.Waiter{Tx: tx.ID, Conn: tx.Info.ConnID, Timeout: tx.Ctx.LockWait, Killed: tx.Killed, OnWait: tx.OnWait}
-	if err := tx.m.locks.Acquire(w, r); err != nil {
-		return err
-	}
-	if r.Kind == lock.Record {
-		tx.lockLog = append(tx.lockLog, lockKey{r.Table, string(r.Key)})
-	}
-	return nil
-}
-
-// Gaps reports whether this transaction takes gap and interval locks.
-func (tx *Tx) Gaps() bool {
-	return tx.Iso == types.RepeatableRead || tx.Iso == types.Serializable
+// Lock takes a lock for this transaction in the lock table.
+func (tx *Tx) Lock(r types.Resource, mode types.LockMode, wait types.WaitFunc) error {
+	w := lock.Waiter{Tx: tx.ID, Conn: tx.Info.ConnID, Timeout: tx.Ctx.LockWait, Killed: tx.Killed, OnWait: wait}
+	return tx.m.locks.Acquire(w, r, mode)
 }
 
 // Writes reports whether the transaction changed anything.

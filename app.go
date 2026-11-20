@@ -86,9 +86,6 @@ type App struct {
 // log, the merge and the writer, then the DriverAPI; then declares pipelines
 // and events and registers the built-in handler groups.
 func New(cfg Config) *App {
-	if cfg.AutoIncrementGap == 0 {
-		cfg.AutoIncrementGap = 1000000
-	}
 	app := &App{cfg: cfg}
 
 	app.pipe = framework.NewPipeline(&app.global)
@@ -105,7 +102,7 @@ func New(cfg Config) *App {
 	})
 	app.locks = lock.New(app.mem)
 	app.seq = &changelog.Sequence{}
-	app.txn = txn.New(app.store, app.locks, app.catalog, app.seq, cfg.AutoIncrementGap)
+	app.txn = txn.New(app.store, app.locks, app.catalog, app.seq)
 	app.merge = merge.New(merge.Config{CountDeclineKeys: cfg.CountDeclineKeys, KeyBatch: cfg.LookupBatch}, merge.Hooks{})
 	app.writer = write.New(app.mem, app.merge)
 	app.clients = session.NewClients()

@@ -10,6 +10,7 @@ import (
 	"github.com/virtual-db/vdb-core/internal/catalog"
 	"github.com/virtual-db/vdb-core/internal/delta"
 	"github.com/virtual-db/vdb-core/internal/framework"
+	"github.com/virtual-db/vdb-core/internal/lock"
 	"github.com/virtual-db/vdb-core/internal/memory"
 	"github.com/virtual-db/vdb-core/internal/payloads"
 	"github.com/virtual-db/vdb-core/internal/points"
@@ -42,7 +43,7 @@ func New(p Pipelines, sessions *session.Registry, m *txn.Manager, cat *catalog.C
 	return &Impl{p: p, sessions: sessions, txn: m, catalog: cat, mem: mem}
 }
 
-// OpenSession opens a session for a mysqld connection.
+// OpenSession opens a session for one of the engine's client connections.
 func (a *Impl) OpenSession(info types.SessionInfo) (types.Session, error) {
 	return a.sessions.Open(info), nil
 }
@@ -52,6 +53,35 @@ func (a *Impl) Kill(connID uint64) { a.sessions.Kill(connID) }
 
 // Catalog returns the catalog of record.
 func (a *Impl) Catalog() types.Catalog { return a.catalog }
+
+// Locks returns the lock table.
+func (a *Impl) Locks() types.Locks { return locks{a.txn.Locks()} }
+
+// locks adapts the lock table to types.Locks: each call acts for the session's
+// open transaction.
+type locks struct{ m *lock.Manager }
+
+func (l locks) Define(m types.LockModes) { l.m.Define(m) }
+
+func (l locks) Acquire(s types.Session, r types.Resource, mode types.LockMode, wait types.WaitFunc) error {
+	ss, ok := s.(*session.Session)
+	if !ok {
+		return types.Errorf(types.ErrInternal, "lock for a session the core did not open")
+	}
+	return ss.Lock(r, mode, wait)
+}
+
+func (l locks) ReleaseSince(s types.Session, mark types.LockMark) {
+	if ss, ok := s.(*session.Session); ok && ss.TxID() != 0 {
+		l.m.ReleaseSince(ss.TxID(), mark)
+	}
+}
+
+func (l locks) ReleaseIf(s types.Session, drop func(types.Resource, types.LockMode) bool) {
+	if ss, ok := s.(*session.Session); ok && ss.TxID() != 0 {
+		l.m.ReleaseIf(ss.TxID(), drop)
+	}
+}
 
 // ConnectionOpened runs vdb.connection.opened.
 func (a *Impl) ConnectionOpened(connID uint64, account, addr string) error {
