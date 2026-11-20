@@ -332,7 +332,7 @@ func equalityProven(d *types.TableDef) bool {
 
 func refusedCollation(d *types.TableDef) error {
 	return &types.Error{Code: types.ErrRefused, Table: d.ID,
-		Msg: "table " + d.Database + "." + d.Name + " has an identity key not proven for equality; updates and deletes of Source rows are refused (D-62)"}
+		Msg: "table " + d.QualifiedName() + " has an identity key not proven for equality; updates and deletes of Source rows are refused (D-62)"}
 }
 
 // oldRowOf returns the full old row: the Delta row's, or the one the engine

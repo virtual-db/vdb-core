@@ -1,6 +1,9 @@
 // Package types — catalog.go
 //
-// The catalog of record's types (implementation plan doc 06 §1.1).
+// The catalog of record's types (implementation plan doc 06 §1.1). They hold
+// what the core itself needs, in a form any engine can fill; each entry has an
+// opaque engine part (Engine) that the core stores, versions, records in change
+// sets and restores, but never reads (D-88).
 package types
 
 import "strings"
@@ -38,63 +41,34 @@ const WholeRow IndexID = 0xFFFF
 
 // ColumnDef is one column.
 type ColumnDef struct {
-	Name          string
-	Pos           uint16
-	Type          string // the column's SQL type as the engine prints it, e.g. "varchar(20)"
-	Charset       string
-	Collation     string
-	Nullable      bool
-	Fetch         FetchMode
-	Default       Value
-	Timestamp     bool // TIMESTAMP columns travel as Unix time
-	Float         bool // FLOAT and DOUBLE columns are never pushed down
-	AutoIncrement bool
+	Name     string
+	Pos      uint16
+	Nullable bool
+	Fetch    FetchMode
+	Default  Value
+	Engine   []byte
 }
 
 // IndexDef is one index. Index 0 is the identity key when the table has one.
+// The engine sets OrderProven and EqualityProven from its own rules.
 type IndexDef struct {
 	ID             IndexID
 	Name           string
 	Primary        bool
 	Unique         bool
 	Columns        []uint16
-	PartLens       []uint32 // sort-image length of each key part
 	OrderProven    bool
 	EqualityProven bool
 	AddedLocally   bool
-}
-
-// FKAction is a foreign-key referential action.
-type FKAction uint8
-
-const (
-	FKRestrict FKAction = iota
-	FKNoAction
-	FKCascade
-	FKSetNull
-)
-
-// ForeignKeyDef is one foreign key declared on a child table.
-type ForeignKeyDef struct {
-	Name          string
-	Columns       []uint16 // child columns
-	ChildIndex    IndexID  // the child's supporting index
-	ParentDB      string
-	ParentTable   string
-	ParentColumns []string
-	ParentIndex   IndexID // resolved by the catalog: the parent key referenced
-	OnDelete      FKAction
-	OnUpdate      FKAction
+	Engine         []byte
 }
 
 // SourceMapping ties a mirrored table to its Source table.
 type SourceMapping struct {
-	Database    string
+	Namespace   []string
 	Table       string
-	Definition  string // the Source's SHOW CREATE TABLE
 	Fingerprint string
-	AutoInc     uint64 // the Source's AUTO_INCREMENT at discovery (D-15)
-	RowsEst     uint64
+	Engine      []byte
 }
 
 // LocalChangeKind classifies a client DDL change on a mirrored table.
@@ -113,25 +87,35 @@ const (
 
 // LocalChange is one client DDL change kept on a mirrored table.
 type LocalChange struct {
-	Kind      LocalChangeKind
-	Object    string
-	Statement string
+	Kind   LocalChangeKind
+	Object string
+	Engine []byte
 }
 
 // TableDef is one table of the catalog of record.
+//
+// Namespace is the table's place in the engine's naming: for MySQL the
+// database ([db]); for PostgreSQL [db, schema]. KeyNeedsShadows, set by the
+// engine, says a Source key can equal a Delta key without being byte-equal
+// (product doc 03 §2.4).
 type TableDef struct {
-	ID           TableID
-	Database     string
-	Name         string
-	Kind         TableKind
-	Version      uint64
-	Columns      []ColumnDef
-	Indexes      []IndexDef
-	Identity     IndexID
-	ForeignKeys  []ForeignKeyDef
-	Definition   string
-	Source       *SourceMapping
-	LocalChanges []LocalChange
+	ID              TableID
+	Namespace       []string
+	Name            string
+	Kind            TableKind
+	Version         uint64
+	Columns         []ColumnDef
+	Indexes         []IndexDef
+	Identity        IndexID
+	KeyNeedsShadows bool
+	Source          *SourceMapping
+	LocalChanges    []LocalChange
+	Engine          []byte
+}
+
+// QualifiedName is the namespace and name joined with dots.
+func (t *TableDef) QualifiedName() string {
+	return strings.Join(append(append([]string(nil), t.Namespace...), t.Name), ".")
 }
 
 // Index returns the index with id, or nil.
@@ -156,27 +140,8 @@ func (t *TableDef) IdentityColumns() []uint16 {
 }
 
 // ShadowsNeeded reports whether a Source row's key can match a Delta key
-// without being byte-equal: only when an identity column has a non-binary
-// collation (product doc 03 §2.4). Shadow sets are skipped otherwise.
-func (t *TableDef) ShadowsNeeded() bool {
-	cols := t.IdentityColumns()
-	if cols == nil {
-		cols = make([]uint16, len(t.Columns))
-		for i := range cols {
-			cols[i] = uint16(i)
-		}
-	}
-	for _, c := range cols {
-		if int(c) >= len(t.Columns) {
-			continue
-		}
-		coll := t.Columns[c].Collation
-		if coll != "" && coll != "binary" && !strings.HasSuffix(coll, "_bin") {
-			return true
-		}
-	}
-	return false
-}
+// without being byte-equal; shadow sets are skipped otherwise.
+func (t *TableDef) ShadowsNeeded() bool { return t.KeyNeedsShadows }
 
 // ColumnByName returns the column's position, or -1.
 func (t *TableDef) ColumnByName(name string) int {
@@ -207,20 +172,6 @@ func equalFold(a, b string) bool {
 	return true
 }
 
-// ObjectKind classifies a non-table catalog object.
-type ObjectKind uint8
-
-const (
-	View ObjectKind = iota
-	Procedure
-	Function
-	Trigger
-)
-
-func (k ObjectKind) String() string {
-	return [...]string{"view", "procedure", "function", "trigger"}[k]
-}
-
 // ObjectOrigin says who created an object.
 type ObjectOrigin uint8
 
@@ -229,17 +180,16 @@ const (
 	ObjectClient
 )
 
-// Object is a view, routine or trigger.
+// Object is a catalog object other than a table; its kind is the engine's
+// (for MySQL "view", "procedure", "function", "trigger").
 type Object struct {
-	Kind      ObjectKind
-	Database  string
+	Kind      string
+	Namespace []string
 	Name      string
-	Statement string
-	SQLMode   string
-	Definer   string
 	Origin    ObjectOrigin
 	Seq       uint64
 	Dropped   bool // a DROP captured from a client
+	Engine    []byte
 }
 
 // CatalogChangeKind classifies a staged DDL change.
@@ -256,13 +206,13 @@ const (
 
 // CatalogChange is a DDL change staged in a transaction (doc 06 §1.2).
 type CatalogChange struct {
-	Kind    CatalogChangeKind
-	Table   TableDef // the new definition (Create, Alter, Rename)
-	ID      TableID  // the table changed (Drop, Rename, Alter)
-	NewDB   string   // Rename
-	NewName string   // Rename
-	Local   *LocalChange
-	Source  bool // applied from the Source through a control session
+	Kind         CatalogChangeKind
+	Table        TableDef // the new definition (Create, Alter, Rename)
+	ID           TableID  // the table changed (Drop, Rename, Alter)
+	NewNamespace []string // Rename
+	NewName      string   // Rename
+	Local        *LocalChange
+	Source       bool // applied from the Source through a control session
 }
 
 // SourceChangeKind classifies a change discovered on the Source.

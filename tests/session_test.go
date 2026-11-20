@@ -168,21 +168,19 @@ func newEnv(t *testing.T) *env {
 	app := core.New(core.Config{DefaultLockWait: 300 * time.Millisecond})
 	app.UseDriver(&sourceServer{src: src})
 	api := app.DriverAPI()
-	pk := core.IndexDef{ID: 0, Name: "PRIMARY", Primary: true, Unique: true, Columns: []uint16{0}, PartLens: []uint32{8}, OrderProven: true, EqualityProven: true}
-	users := core.TableDef{Database: "shop", Name: "users", Kind: core.Mirrored,
+	pk := core.IndexDef{ID: 0, Name: "PRIMARY", Primary: true, Unique: true, Columns: []uint16{0}, OrderProven: true, EqualityProven: true}
+	users := core.TableDef{Namespace: []string{"shop"}, Name: "users", Kind: core.Mirrored,
 		Columns: []core.ColumnDef{{Name: "id"}, {Name: "name"}}, Indexes: []core.IndexDef{pk}, Identity: 0,
-		Source: &core.SourceMapping{Database: "shop", Table: "users"}}
-	orders := core.TableDef{Database: "shop", Name: "orders", Kind: core.Mirrored,
+		Source: &core.SourceMapping{Namespace: []string{"shop"}, Table: "users"}}
+	orders := core.TableDef{Namespace: []string{"shop"}, Name: "orders", Kind: core.Mirrored,
 		Columns:  []core.ColumnDef{{Name: "id"}, {Name: "user_id", Nullable: true}},
-		Indexes:  []core.IndexDef{pk, {ID: 1, Name: "user_id", Columns: []uint16{1}, PartLens: []uint32{8}, OrderProven: true, EqualityProven: true}},
-		Identity: 0, Source: &core.SourceMapping{Database: "shop", Table: "orders"},
-		ForeignKeys: []core.ForeignKeyDef{{Name: "fk_user", Columns: []uint16{1}, ChildIndex: 1, ParentDB: "shop", ParentTable: "users",
-			ParentColumns: []string{"id"}, OnDelete: core.FKCascade, OnUpdate: core.FKRestrict}}}
+		Indexes:  []core.IndexDef{pk, {ID: 1, Name: "user_id", Columns: []uint16{1}, OrderProven: true, EqualityProven: true}},
+		Identity: 0, Source: &core.SourceMapping{Namespace: []string{"shop"}, Table: "orders"}}
 	if err := api.Catalog().Load([]core.TableDef{users, orders}, nil); err != nil {
 		t.Fatal(err)
 	}
-	u, _ := api.Catalog().TableByName("shop", "users")
-	o, _ := api.Catalog().TableByName("shop", "orders")
+	u, _ := api.Catalog().TableByName([]string{"shop"}, "users")
+	o, _ := api.Catalog().TableByName([]string{"shop"}, "orders")
 	src.tables[u.ID] = &fakeTable{rows: map[int]core.Row{1: row(1, "ann"), 2: row(2, "bob"), 3: row(3, "cid")}}
 	src.tables[o.ID] = &fakeTable{rows: map[int]core.Row{10: row(10, "1"), 11: row(11, "1"), 12: row(12, "2")}}
 	return &env{t: t, app: app, api: api, src: src, users: u.ID, orders: o.ID}

@@ -61,13 +61,10 @@ type (
 	FetchMode         = types.FetchMode
 	ColumnDef         = types.ColumnDef
 	IndexDef          = types.IndexDef
-	FKAction          = types.FKAction
-	ForeignKeyDef     = types.ForeignKeyDef
 	SourceMapping     = types.SourceMapping
 	LocalChangeKind   = types.LocalChangeKind
 	LocalChange       = types.LocalChange
 	TableDef          = types.TableDef
-	ObjectKind        = types.ObjectKind
 	ObjectOrigin      = types.ObjectOrigin
 	Object            = types.Object
 	CatalogChangeKind = types.CatalogChangeKind
@@ -117,10 +114,6 @@ const (
 	Virtual              = types.Virtual
 	Transformed          = types.Transformed
 	WholeRow             = types.WholeRow
-	FKRestrict           = types.FKRestrict
-	FKNoAction           = types.FKNoAction
-	FKCascade            = types.FKCascade
-	FKSetNull            = types.FKSetNull
 	AddColumn            = types.AddColumn
 	DropColumn           = types.DropColumn
 	AddIndex             = types.AddIndex
@@ -129,10 +122,6 @@ const (
 	AddForeignKey        = types.AddForeignKey
 	DropForeignKey       = types.DropForeignKey
 	OtherChange          = types.OtherChange
-	View                 = types.View
-	Procedure            = types.Procedure
-	Function             = types.Function
-	Trigger              = types.Trigger
 	ObjectFromSource     = types.ObjectFromSource
 	ObjectClient         = types.ObjectClient
 	CreateTable          = types.CreateTable

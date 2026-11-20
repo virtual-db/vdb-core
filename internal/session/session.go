@@ -381,7 +381,7 @@ func (s *Session) tableName(tx *txn.Tx, t types.TableID) (string, []string) {
 	for i, c := range d.Columns {
 		cols[i] = c.Name
 	}
-	return d.Database + "." + d.Name, cols
+	return d.QualifiedName(), cols
 }
 
 func (s *Session) writeCheck(tx *txn.Tx) error {

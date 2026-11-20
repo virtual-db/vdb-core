@@ -48,7 +48,9 @@ func New() *Catalog {
 // SetHooks installs the hooks. Called once by the core's wiring.
 func (c *Catalog) SetHooks(h Hooks) { c.hooks = h }
 
-func nameKey(db, name string) string { return strings.ToLower(db) + "\x00" + strings.ToLower(name) }
+func nameKey(ns []string, name string) string {
+	return strings.ToLower(strings.Join(ns, "\x00")) + "\x00\x00" + strings.ToLower(name)
+}
 
 // Tables returns every table, ordered by id.
 func (c *Catalog) Tables() []types.TableDef {
@@ -74,10 +76,10 @@ func (c *Catalog) Table(id types.TableID) (types.TableDef, bool) {
 }
 
 // TableByName returns a table by database and name, case-insensitively.
-func (c *Catalog) TableByName(db, name string) (types.TableDef, bool) {
+func (c *Catalog) TableByName(ns []string, name string) (types.TableDef, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	id, ok := c.byName[nameKey(db, name)]
+	id, ok := c.byName[nameKey(ns, name)]
 	if !ok {
 		return types.TableDef{}, false
 	}
@@ -107,15 +109,15 @@ func (c *Catalog) Load(defs []types.TableDef, objs []types.Object) error {
 	c.mu.Lock()
 	for _, d := range defs {
 		d := d
-		if id, ok := c.byName[nameKey(d.Database, d.Name)]; ok {
+		if id, ok := c.byName[nameKey(d.Namespace, d.Name)]; ok {
 			cur := c.tables[id]
 			d.ID = id
 			if cur.Kind == types.Local || cur.Kind == types.Detached {
 				d.Kind = cur.Kind
 			}
 			d.LocalChanges = cur.LocalChanges
-			if cur.Definition != "" && len(cur.LocalChanges) > 0 {
-				d.Definition = cur.Definition
+			if cur.Engine != nil && len(cur.LocalChanges) > 0 {
+				d.Engine = cur.Engine // the definition with the local changes
 			}
 			d.Version = cur.Version + 1
 		} else {
@@ -135,7 +137,6 @@ func (c *Catalog) Load(defs []types.TableDef, objs []types.Object) error {
 	for _, o := range objs {
 		c.addObjectLocked(o)
 	}
-	c.resolveLocked()
 	c.mu.Unlock()
 	if c.hooks.Loaded != nil {
 		for _, d := range loaded {
@@ -147,15 +148,15 @@ func (c *Catalog) Load(defs []types.TableDef, objs []types.Object) error {
 
 func (c *Catalog) put(d *types.TableDef) {
 	if old, ok := c.tables[d.ID]; ok {
-		delete(c.byName, nameKey(old.Database, old.Name))
+		delete(c.byName, nameKey(old.Namespace, old.Name))
 	}
 	c.tables[d.ID] = d
-	c.byName[nameKey(d.Database, d.Name)] = d.ID
+	c.byName[nameKey(d.Namespace, d.Name)] = d.ID
 }
 
 func (c *Catalog) addObjectLocked(o types.Object) {
 	for i, x := range c.objects {
-		if x.Kind == o.Kind && strings.EqualFold(x.Database, o.Database) && strings.EqualFold(x.Name, o.Name) {
+		if x.Kind == o.Kind && strings.EqualFold(strings.Join(x.Namespace, "."), strings.Join(o.Namespace, ".")) && strings.EqualFold(x.Name, o.Name) {
 			c.objects = append(c.objects[:i], c.objects[i+1:]...)
 			break
 		}
@@ -168,39 +169,6 @@ func (c *Catalog) addObjectLocked(o types.Object) {
 	c.objects = append(c.objects, o)
 }
 
-// resolveLocked fills every foreign key's ParentIndex.
-func (c *Catalog) resolveLocked() {
-	for _, t := range c.tables {
-		for i := range t.ForeignKeys {
-			fk := &t.ForeignKeys[i]
-			pid, ok := c.byName[nameKey(fk.ParentDB, fk.ParentTable)]
-			if !ok {
-				continue
-			}
-			p := c.tables[pid]
-			for _, ix := range p.Indexes {
-				if !ix.Unique && !ix.Primary {
-					continue
-				}
-				if len(ix.Columns) != len(fk.ParentColumns) {
-					continue
-				}
-				match := true
-				for k, col := range ix.Columns {
-					if int(col) >= len(p.Columns) || !strings.EqualFold(p.Columns[col].Name, fk.ParentColumns[k]) {
-						match = false
-						break
-					}
-				}
-				if match {
-					fk.ParentIndex = ix.ID
-					break
-				}
-			}
-		}
-	}
-}
-
 // ApplySource applies a Source change outside any client transaction.
 func (c *Catalog) ApplySource(ch types.SourceChange) (types.TableID, error) {
 	var inval *types.TableDef
@@ -209,7 +177,7 @@ func (c *Catalog) ApplySource(ch types.SourceChange) (types.TableID, error) {
 	switch ch.Kind {
 	case types.SourceTableAdded:
 		d := ch.Table
-		if existing, ok := c.byName[nameKey(d.Database, d.Name)]; ok {
+		if existing, ok := c.byName[nameKey(d.Namespace, d.Name)]; ok {
 			d.ID = existing
 		} else {
 			d.ID = c.nextID
@@ -243,7 +211,7 @@ func (c *Catalog) ApplySource(ch types.SourceChange) (types.TableID, error) {
 	case types.SourceTableDropped:
 		cur, ok := c.tables[ch.ID]
 		if ok {
-			delete(c.byName, nameKey(cur.Database, cur.Name))
+			delete(c.byName, nameKey(cur.Namespace, cur.Name))
 			delete(c.tables, ch.ID)
 			delete(c.providers, ch.ID)
 			inval = cur
@@ -256,12 +224,12 @@ func (c *Catalog) ApplySource(ch types.SourceChange) (types.TableID, error) {
 			return 0, fmt.Errorf("catalog.apply_source: unknown table %d", ch.ID)
 		}
 		d := *cur
-		d.Database, d.Name = ch.Table.Database, ch.Table.Name
+		d.Namespace, d.Name = ch.Table.Namespace, ch.Table.Name
 		if ch.Table.Source != nil {
 			d.Source = ch.Table.Source
 		}
-		if ch.Table.Definition != "" {
-			d.Definition = ch.Table.Definition
+		if ch.Table.Engine != nil {
+			d.Engine = ch.Table.Engine
 		}
 		d.Version++
 		c.put(&d)
@@ -276,7 +244,6 @@ func (c *Catalog) ApplySource(ch types.SourceChange) (types.TableID, error) {
 		o.Dropped = true
 		c.addObjectLocked(o)
 	}
-	c.resolveLocked()
 	c.mu.Unlock()
 	if inval != nil && c.hooks.Invalidated != nil {
 		c.hooks.Invalidated(*inval)
@@ -302,7 +269,7 @@ func (c *Catalog) Apply(ch types.CatalogChange) error {
 		inval = &d
 	case types.DropTable:
 		if cur, ok := c.tables[ch.ID]; ok {
-			delete(c.byName, nameKey(cur.Database, cur.Name))
+			delete(c.byName, nameKey(cur.Namespace, cur.Name))
 			delete(c.tables, ch.ID)
 			inval = cur
 		}
@@ -313,9 +280,9 @@ func (c *Catalog) Apply(ch types.CatalogChange) error {
 			return fmt.Errorf("catalog.apply: rename of unknown table %d", ch.ID)
 		}
 		d := *cur
-		d.Database, d.Name = ch.NewDB, ch.NewName
-		if ch.Table.Definition != "" {
-			d.Definition = ch.Table.Definition
+		d.Namespace, d.Name = ch.NewNamespace, ch.NewName
+		if ch.Table.Engine != nil {
+			d.Engine = ch.Table.Engine
 		}
 		d.Version++
 		c.put(&d)
@@ -347,7 +314,6 @@ func (c *Catalog) Apply(ch types.CatalogChange) error {
 		c.put(&d)
 		inval = &d
 	}
-	c.resolveLocked()
 	c.mu.Unlock()
 	if inval != nil && c.hooks.Invalidated != nil {
 		c.hooks.Invalidated(*inval)
@@ -393,32 +359,4 @@ func (c *Catalog) Provider(id types.TableID) (types.RowProvider, bool) {
 	defer c.mu.RUnlock()
 	p, ok := c.providers[id]
 	return p, ok
-}
-
-// Children returns every foreign key whose parent is the table id, with the child table.
-func (c *Catalog) Children(id types.TableID) []ChildFK {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	p, ok := c.tables[id]
-	if !ok {
-		return nil
-	}
-	var out []ChildFK
-	for _, t := range c.tables {
-		for _, fk := range t.ForeignKeys {
-			if strings.EqualFold(fk.ParentDB, p.Database) && strings.EqualFold(fk.ParentTable, p.Name) {
-				out = append(out, ChildFK{Child: t.ID, FK: fk})
-			}
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Child < out[j].Child || (out[i].Child == out[j].Child && out[i].FK.Name < out[j].FK.Name)
-	})
-	return out
-}
-
-// ChildFK is a foreign key with its child table.
-type ChildFK struct {
-	Child types.TableID
-	FK    types.ForeignKeyDef
 }

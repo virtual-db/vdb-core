@@ -1,6 +1,7 @@
 package core
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/virtual-db/vdb-core/internal/catalog"
@@ -150,7 +151,7 @@ func (a *App) wire() {
 		KeyConflict: func(t types.TableID, img types.KeyImage) {
 			name := ""
 			if d, ok := a.catalog.Table(t); ok {
-				name = d.Database + "." + d.Name
+				name = d.QualifiedName()
 			}
 			a.bus.Emit(points.EventKeyConflict, payloads.KeyConflictPayload{Table: name, TableID: t, KeyImage: img})
 		},
@@ -171,7 +172,7 @@ func (a *App) recordsHook(pipeline, transform, emitPoint string) merge.RecordsFu
 			}
 		}
 		out, err := a.pipe.Process(pipeline, payloads.RecordsPayload{
-			ConnectionID: tx.Info.ConnID, Table: d.Database + "." + d.Name, Columns: names, Rows: rows})
+			ConnectionID: tx.Info.ConnID, Table: d.QualifiedName(), Columns: names, Rows: rows})
 		if err != nil {
 			return nil, err
 		}
@@ -188,7 +189,7 @@ func schemaPayload(t types.TableDef) payloads.SchemaPayload {
 	for i, c := range t.Columns {
 		cols[i] = c.Name
 	}
-	return payloads.SchemaPayload{Database: t.Database, Table: t.Name, TableID: t.ID, Kind: t.Kind.String(), Version: t.Version, Columns: cols}
+	return payloads.SchemaPayload{Database: strings.Join(t.Namespace, "."), Table: t.Name, TableID: t.ID, Kind: t.Kind.String(), Version: t.Version, Columns: cols}
 }
 
 // mustRegisterBuiltinHandlers registers all built-in framework handlers.

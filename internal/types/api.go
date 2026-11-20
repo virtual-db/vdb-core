@@ -104,7 +104,7 @@ type ScanHandle interface {
 type Catalog interface {
 	Tables() []TableDef
 	Table(id TableID) (TableDef, bool)
-	TableByName(db, name string) (TableDef, bool)
+	TableByName(namespace []string, name string) (TableDef, bool)
 	Objects() []Object
 
 	Load(defs []TableDef, objs []Object) error
