@@ -158,13 +158,25 @@ func (m *Merge) lookupSource(tx *txn.Tx, d *types.TableDef, view *delta.Table, i
 		if tx.LookupCache == nil {
 			tx.LookupCache = map[string]txn.CachedLookup{}
 		}
-		for _, i := range part {
-			tx.LookupCache[cacheKey(keys[i])] = txn.CachedLookup{}
+		// A key value asked more than once in the batch is answered once per
+		// occurrence; the cache keeps the answer of its first occurrence only,
+		// or later lookups of it would return its rows twice.
+		first := map[string]uint32{}
+		for bi, i := range part {
+			ck := cacheKey(keys[i])
+			if _, ok := first[ck]; !ok {
+				first[ck] = uint32(bi)
+				tx.LookupCache[ck] = txn.CachedLookup{}
+			}
 		}
 		for j := range sr.Rows {
-			orig := part[sr.KeyIdx[j]]
+			bi := sr.KeyIdx[j]
+			orig := part[bi]
 			sr.KeyIdx[j] = uint32(orig)
 			ck := cacheKey(keys[orig])
+			if first[ck] != bi {
+				continue
+			}
 			c := tx.LookupCache[ck]
 			c.Rows = append(c.Rows, sr.Rows[j])
 			if j < len(sr.Keys) {
