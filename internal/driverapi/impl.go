@@ -102,6 +102,9 @@ func (a *Impl) Transforms() []string { return a.p.Transforms() }
 // Emit publishes an engine event.
 func (a *Impl) Emit(event string, payload any) { a.p.Emit(event, payload) }
 
+// HasHandlers reports whether anything besides the built-in handlers is attached to a point.
+func (a *Impl) HasHandlers(point string) bool { return a.p.HasHandlers(point) }
+
 // Delta returns a stable read of the committed Delta.
 func (a *Impl) Delta() types.DeltaReader { return reader{a.txn.Store().Snapshot()} }
 

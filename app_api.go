@@ -9,7 +9,9 @@ import (
 
 // UseDriver registers s as the database server. The composition root calls
 // DriverAPI() explicitly and passes the result to the driver constructor before
-// calling UseDriver.
+// calling UseDriver. When s implements SourceProvider or MemoryProber, its
+// Source and memory probe are registered too, so the composition root never
+// reaches inside the engine.
 //
 // Panics if called after Run has started. Returns *App for method chaining.
 func (a *App) UseDriver(s Server) *App {
@@ -19,19 +21,15 @@ func (a *App) UseDriver(s Server) *App {
 		panic("core: UseDriver called after Run")
 	}
 	a.server = s
-	return a
-}
-
-// UseSource registers the engine's Source adapter. Must be called before
-// Run. Panics after Run. Returns *App for method chaining.
-func (a *App) UseSource(s Source) *App {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.running {
-		panic("core: UseSource called after Run")
+	if sp, ok := s.(SourceProvider); ok {
+		if src := sp.Source(); src != nil {
+			a.source = src
+			a.txn.SetSource(src)
+		}
 	}
-	a.source = s
-	a.txn.SetSource(s)
+	if mp, ok := s.(MemoryProber); ok {
+		a.mem.SetProbe(mp.MemoryProbe)
+	}
 	return a
 }
 

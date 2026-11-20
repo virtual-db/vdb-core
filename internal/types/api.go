@@ -31,6 +31,9 @@ type DriverAPI interface {
 	Transforms() []string
 	// Emit publishes an engine event (vdb.source.requested and the others).
 	Emit(event string, payload any)
+	// HasHandlers reports whether anything besides the built-in handlers is
+	// attached to a point.
+	HasHandlers(point string) bool
 }
 
 // Session is one mysqld connection's view of the core. Used by one goroutine

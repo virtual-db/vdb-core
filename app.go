@@ -97,7 +97,7 @@ func New(cfg Config) *App {
 	app.catalog = catalog.New()
 	app.store = delta.NewStore()
 	app.mem = memory.New(memory.Config{
-		Reserve: cfg.MemoryReserve, DeltaMaxBytes: cfg.DeltaMaxBytes, Probe: cfg.MemoryProbe,
+		Reserve: cfg.MemoryReserve, DeltaMaxBytes: cfg.DeltaMaxBytes,
 		DeltaBytes: app.store.Bytes,
 		OnRefusal: func(kind string, limit uint64) {
 			app.bus.Emit(points.EventLimitReached, payloads.LimitReachedPayload{Limit: kind, Value: limit})

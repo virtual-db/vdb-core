@@ -166,7 +166,7 @@ func images(id int) []core.KeyImage { return []core.KeyImage{img(id)} }
 func newEnv(t *testing.T) *env {
 	src := &fakeSource{tables: map[core.TableID]*fakeTable{}}
 	app := core.New(core.Config{DefaultLockWait: 300 * time.Millisecond})
-	app.UseSource(src)
+	app.UseDriver(&sourceServer{src: src})
 	api := app.DriverAPI()
 	pk := core.IndexDef{ID: 0, Name: "PRIMARY", Primary: true, Unique: true, Columns: []uint16{0}, PartLens: []uint32{8}, OrderProven: true, EqualityProven: true}
 	users := core.TableDef{Database: "shop", Name: "users", Kind: core.Mirrored,

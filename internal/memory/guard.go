@@ -57,6 +57,14 @@ type Guard struct {
 	now      func() time.Time
 }
 
+// SetProbe installs the probe of every process to count. Called once, before
+// the first write (UseDriver).
+func (g *Guard) SetProbe(p types.MemoryProbe) {
+	g.mu.Lock()
+	g.cfg.Probe = p
+	g.mu.Unlock()
+}
+
 // New builds a guard and sets the Go runtime's memory limit to the ceiling.
 func New(cfg Config) *Guard {
 	if cfg.Reserve <= 0 || cfg.Reserve >= 1 {

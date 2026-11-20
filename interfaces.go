@@ -29,9 +29,8 @@ type Config struct {
 	PluginDir string
 
 	// Memory (product doc 12 §4).
-	MemoryReserve float64     // fraction kept free; 0.10 by default
-	DeltaMaxBytes uint64      // 0 means no fixed cap
-	MemoryProbe   MemoryProbe // resident memory of every process to count
+	MemoryReserve float64 // fraction kept free; 0.10 by default
+	DeltaMaxBytes uint64  // 0 means no fixed cap
 
 	// Writes (product doc 10 §5).
 	AutoIncrementGap uint64 // 1,000,000 by default (D-15)
@@ -51,4 +50,18 @@ type Server interface {
 	Run() error
 	// Stop signals Run to return.
 	Stop() error
+}
+
+// SourceProvider is implemented by a Server that reads a Source. UseDriver
+// registers its Source with the transaction manager; without one, every table
+// is local (implementation plan doc 03 §2).
+type SourceProvider interface {
+	Source() Source
+}
+
+// MemoryProber is implemented by a Server that runs processes besides this
+// one. UseDriver hands its probe to the memory guard; without one, the guard
+// measures this process only.
+type MemoryProber interface {
+	MemoryProbe() (rss uint64, err error)
 }

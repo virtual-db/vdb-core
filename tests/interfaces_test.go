@@ -1,7 +1,7 @@
 // Package core_test — tests/interfaces_test.go
 //
 // Compile-time and runtime checks of the public API's shape: Server,
-// DriverAPI, UseDriver, UseSource and HasHandlers.
+// DriverAPI, UseDriver (with its optional Source and probe) and HasHandlers.
 package core_test
 
 import (
@@ -26,11 +26,27 @@ func TestUseDriverReturnsApp(t *testing.T) {
 	}
 }
 
-// TestUseSourceReturnsApp verifies UseSource supports method chaining.
-func TestUseSourceReturnsApp(t *testing.T) {
+// sourceServer is a Server that supplies a Source and a memory probe.
+type sourceServer struct {
+	src    core.Source
+	probed bool
+}
+
+func (s *sourceServer) Run() error          { return nil }
+func (s *sourceServer) Stop() error         { return nil }
+func (s *sourceServer) Source() core.Source { return s.src }
+func (s *sourceServer) MemoryProbe() (uint64, error) {
+	s.probed = true
+	return 0, nil
+}
+
+// TestUseDriverTakesSourceAndProbe verifies UseDriver accepts a Server that
+// also supplies a Source and a memory probe, and still chains.
+func TestUseDriverTakesSourceAndProbe(t *testing.T) {
 	app := core.New(core.Config{})
-	if got := app.UseSource(nil); got != app {
-		t.Fatal("UseSource must return the same *App")
+	srv := &sourceServer{}
+	if got := app.UseDriver(srv); got != app {
+		t.Fatal("UseDriver must return the same *App")
 	}
 }
 
