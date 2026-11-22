@@ -1,12 +1,12 @@
-# ci.yml: Lint and Test on pull requests and on main; the status checks main's
+# ci.yml: Lint and Test on pull requests; the status checks main's
 # branch protection requires (plan doc 14 §4). vdb-core has no private
 # dependencies, so no token beyond GITHUB_TOKEN is needed. Versions are plain
 # git tags; there is no release workflow (D-91).
+# They do not run again on the merge to main, which only takes pull requests
+# that passed them.
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 jobs:
