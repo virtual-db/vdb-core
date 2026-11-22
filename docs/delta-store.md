@@ -31,4 +31,4 @@ the Delta first; `COUNT(*)` is the Source count minus touched keys still on the 
 ## Memory
 
 Each tree entry is accounted in its table's state; the memory guard decides with the resident memory of every
-process, keeping `MemoryReserve` free, and refuses a growing write with `ErrDeltaFull` (MySQL error 1114).
+process, keeping `MemoryReserve` free, and refuses a growing write with `ErrDeltaFull`, which the engine maps to its own error (1114 in the MySQL engine).

@@ -2,15 +2,15 @@
 
 `github.com/virtual-db/vdb-core`
 
-The database-agnostic core of VirtualDB: the Delta (copy-on-write B-trees of rows, touched Source keys and index entries), the merge with the Source, transactions with savepoints and snapshot pairs, row and gap locks with deadlock detection, uniqueness, foreign keys, the catalog of record, change sets for persistence, and the memory limit, plus the pipelines, event bus and plugin host. It never sees SQL: keys are sort images and values are opaque bytes computed by the engine.
+The engine-agnostic core of VirtualDB: the Delta (copy-on-write B-trees of rows, touched Source keys and index entries), the merge with the Source, uniqueness and writes over key images, transactions with savepoints and snapshot timing, a lock table with waits, timeouts, deadlock detection and lock memory over resources and modes the engine defines, the engine-neutral catalog of record, change sets for persistence, and the memory limit, plus the pipelines, event bus and plugin host. It holds only what any database engine could use: it never sees SQL, keys are sort images, values are opaque bytes, and lock kinds, isolation rules, foreign keys and auto-increment belong to the engine.
 
-An **engine** (VDB for MySQL is `vdb-mysql`) implements `Server` and `Source`, opens a `Session` per database connection through `DriverAPI`, and calls `Run`.
+An **engine** implements `Server` (and, optionally, `SourceProvider` and `MemoryProber`), opens a `Session` per database connection through `DriverAPI`, and is started by `Run`. VDB for MySQL's engine is [`vdb-mysql-engine`](https://github.com/virtual-db/vdb-mysql-engine), assembled into the image by [`vdb-mysql`](https://github.com/virtual-db/vdb-mysql).
 
 ---
 
 ## Requirements
 
-- Go 1.26.9 (the version every VDB module uses)
+- Go 1.27.4 (the version every VDB module uses)
 - Module: `github.com/virtual-db/vdb-core`
 
 ---
@@ -18,11 +18,10 @@ An **engine** (VDB for MySQL is `vdb-mysql`) implements `Server` and `Source`, o
 ## Quick Start
 
 ```go
-app := core.New(core.Config{PluginDir: "plugins", MemoryProbe: probe})
-app.UseSource(mySourceAdapter)
+app := core.New(core.Config{PluginDir: "plugins"})
 
 api := app.DriverAPI()
-srv := myengine.New(cfg, api)
+srv := myengine.NewDriver(cfg, api) // implements Server; SourceProvider and MemoryProber if it has them
 
 app.
     UseDriver(srv).
@@ -58,8 +57,7 @@ log.Fatal(app.Run())
 |---|---|
 | `New(cfg Config) *App` | Construct and initialise the framework. |
 | `DriverAPI() DriverAPI` | Get the framework's `DriverAPI` bridge. Call before `UseDriver`. |
-| `UseDriver(s Server) *App` | Register the engine's server. Must be called before `Run`. |
-| `UseSource(s Source) *App` | Register the engine's Source adapter. Must be called before `Run`. |
+| `UseDriver(s Server) *App` | Register the engine. If it also implements `SourceProvider` or `MemoryProber`, its Source and memory probe are registered too. Must be called before `Run`. |
 | `HasHandlers(point string) bool` | Whether anything other than a built-in handler is attached to a point. |
 | `Attach(point string, priority int, fn PointFunc) *App` | Register a handler at a pipeline point. Panics on unknown point or after `Run`. |
 | `Subscribe(event string, fn EventFunc) *App` | Register an event subscriber. Panics after `Run`. |
@@ -81,16 +79,17 @@ type Server interface {
     Stop() error
 }
 
-// Implemented by the engine: the Source the merge reads (docs/implementing-a-driver.md).
-type Source interface {
-    Snapshot(s SessionInfo, ctx StmtContext) (SourceSnapshot, error)
-}
+// Optional, on the same value: the Source the merge reads, and the resident
+// memory to count against the memory ceiling (docs/implementing-a-driver.md).
+type SourceProvider interface { Source() Source }
+type MemoryProber interface { MemoryProbe() (rss uint64, err error) }
 
 // Implemented by the core. The engine opens one Session per database connection.
 type DriverAPI interface {
     OpenSession(info SessionInfo) (Session, error)
     Kill(connID uint64)
     Catalog() Catalog
+    Locks() Locks // the lock table: Define(modes), Acquire, ReleaseSince
     ConnectionOpened(connID uint64, account, addr string) error
     ConnectionClosed(connID uint64, account, addr string)
     QueryReceived(connID uint64, query, database string) (string, error)
@@ -101,10 +100,11 @@ type DriverAPI interface {
     Delta() DeltaReader
     Transforms() []string
     Emit(event string, payload any)
+    HasHandlers(point string) bool
 }
 
-// Session: statements, transactions and savepoints; Scan, Lookup, Count;
-// Insert, Update, Delete, Truncate, AutoIncrement; staged DDL; End.
+// Session: statements, transactions and savepoints; Scan, Lookup, ByColumns, Count;
+// Insert, Update, Delete, Truncate; staged DDL; LockMark; End.
 // See types.go and internal/types/api.go for every signature.
 ```
 

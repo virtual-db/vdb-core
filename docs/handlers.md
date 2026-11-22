@@ -6,7 +6,7 @@ Technical reference for writing pipeline handlers and event subscribers in Virtu
 
 ## `PointFunc` — the handler signature
 
-```/dev/null/example.go#L1-1
+```go
 type PointFunc func(ctx any, payload any) (any, any, error)
 ```
 
@@ -24,7 +24,7 @@ Every handler attached to a pipeline point must conform to this signature.
 
 ## `EventFunc` — the subscriber signature
 
-```/dev/null/example.go#L1-1
+```go
 type EventFunc func(ctx any, payload any) error
 ```
 
@@ -42,7 +42,7 @@ Subscribers registered on the event bus use this signature.
 
 Every handler receives a `framework.HandlerContext` as its `ctx any` argument. Type-assert it before use.
 
-```/dev/null/example.go#L1-8
+```go
 import "github.com/virtual-db/core/internal/framework"
 
 func myHandler(ctx any, payload any) (any, any, error) {
@@ -98,7 +98,7 @@ The `vdb.context.create.contribute` point is the **only** place where values can
 
 ### Writing a value during startup
 
-```/dev/null/example.go#L1-8
+```go
 app.Attach("vdb.context.create.contribute", 5, func(ctx any, payload any) (any, any, error) {
     b := payload.(*framework.GlobalContextBuilder)
     b.Set("my-service-config", loadConfig())
@@ -111,7 +111,7 @@ app.Attach("vdb.context.create.contribute", 5, func(ctx any, payload any) (any, 
 
 ### Reading a contributed value in any subsequent handler
 
-```/dev/null/example.go#L1-9
+```go
 app.Attach("vdb.query.received.intercept", 20, func(ctx any, payload any) (any, any, error) {
     hctx := ctx.(framework.HandlerContext)
     cfg := hctx.Global.Get("my-service-config").(*MyConfig)
@@ -129,97 +129,74 @@ app.Attach("vdb.query.received.intercept", 20, func(ctx any, payload any) (any, 
 
 ## Common handler patterns
 
+The payload is a struct of `internal/payloads` (fields in [pipelines.md](pipelines.md)). Code outside `vdb-core` cannot
+name those types, so it reads the payload by field name and may return it as a `map[string]any` with the same field
+names; the core decodes either form, as it does for out-of-process plugins. The helper below is used in the examples:
+
+```go
+// fields returns the payload's fields by name.
+func fields(payload any) map[string]any {
+    b, _ := json.Marshal(payload)
+    m := map[string]any{}
+    _ = json.Unmarshal(b, &m)
+    return m
+}
+```
+
 ### 1. Query rewriting
 
-Attach to `vdb.query.received.intercept` to inspect or rewrite the incoming SQL string before any processing occurs.
+Attach to `vdb.query.received.intercept` to rewrite a statement before the engine runs it.
 
-```/dev/null/example.go#L1-13
+```go
 app.Attach("vdb.query.received.intercept", 5, func(ctx any, payload any) (any, any, error) {
-    p := payload.(*pipelines.QueryReceivedPayload)
-
-    // Replace a legacy table name with the current one.
-    p.Query = strings.ReplaceAll(p.Query, "legacy_orders", "orders")
-
+    p := fields(payload)
+    p["Query"] = strings.ReplaceAll(p["Query"].(string), "legacy_orders", "orders")
     return ctx, p, nil
 })
 ```
 
-Priority 5 ensures the rewrite happens before the framework parses or routes the query at priority 10.
+### 2. Blocking a transaction
 
-### 2. Record filtering on read
+Attach to `vdb.transaction.begin.authorize` and return an error to refuse the transaction.
 
-Attach to `vdb.records.source.transform` to remove rows from the result set before they are returned to the driver.
-
-```/dev/null/example.go#L1-18
-app.Attach("vdb.records.source.transform", 20, func(ctx any, payload any) (any, any, error) {
-    p := payload.(*pipelines.RecordsSourcePayload)
-
-    filtered := p.Records[:0]
-    for _, rec := range p.Records {
-        if rec["deleted_at"] == nil {
-            filtered = append(filtered, rec)
-        }
-    }
-    p.Records = filtered
-
-    return ctx, p, nil
-})
-```
-
-### 3. Record enrichment on write
-
-Attach to `vdb.write.insert.apply` to add or overwrite fields on a record before it is stored in the delta.
-
-```/dev/null/example.go#L1-12
-app.Attach("vdb.write.insert.apply", 20, func(ctx any, payload any) (any, any, error) {
-    p := payload.(*pipelines.WriteInsertPayload)
-
-    if p.Record["created_at"] == nil {
-        p.Record["created_at"] = time.Now().UTC().Format(time.RFC3339)
-    }
-
-    return ctx, p, nil
-})
-```
-
-### 4. Blocking a transaction
-
-Attach to `vdb.transaction.begin.authorize` and return an error to deny the transaction before it is opened.
-
-```/dev/null/example.go#L1-14
+```go
 app.Attach("vdb.transaction.begin.authorize", 5, func(ctx any, payload any) (any, any, error) {
     hctx := ctx.(framework.HandlerContext)
-    cfg := hctx.Global.Get("tx-policy").(*TxPolicy)
-
-    if cfg.ReadOnly {
+    if policy, _ := hctx.Global.Get("tx-policy").(*TxPolicy); policy != nil && policy.ReadOnly {
         return ctx, payload, errors.New("transactions are disabled in read-only mode")
     }
-
     return ctx, payload, nil
 })
 ```
 
-Returning a non-nil error here propagates back to the `DriverAPI` caller. The transaction is never opened.
+The error is returned to the engine and the transaction is not opened.
 
-### 5. Emitting a custom event from inside a handler
+### 3. Persisting committed changes
 
-Use `hctx.Global.Bus().Emit(...)` to publish an event to all registered subscribers for a given topic.
+Attach to `vdb.transaction.commit.apply` below 10. The payload's `Change` is the transaction's change set; an error
+fails the commit.
 
-```/dev/null/example.go#L1-15
-app.Attach("vdb.write.insert.apply", 50, func(ctx any, payload any) (any, any, error) {
-    hctx := ctx.(framework.HandlerContext)
-    p := payload.(*pipelines.WriteInsertPayload)
-
-    hctx.Global.Bus().Emit("my-app.record.inserted", &MyRecordInsertedEvent{
-        Table:  p.Table,
-        Record: p.Record,
-    })
-
-    return ctx, p, nil
+```go
+app.Attach("vdb.transaction.commit.apply", 5, func(ctx any, payload any) (any, any, error) {
+    if err := store.Append(fields(payload)["Change"]); err != nil {
+        return ctx, payload, err
+    }
+    return ctx, payload, nil
 })
 ```
 
-Subscribers registered for `"my-app.record.inserted"` will be called synchronously before `Emit` returns. Errors returned by subscribers are logged and do not affect the handler that called `Emit`.
+### 4. Emitting a custom event from a handler
+
+```go
+app.Attach("vdb.write.insert.emit", 50, func(ctx any, payload any) (any, any, error) {
+    hctx := ctx.(framework.HandlerContext)
+    hctx.Global.Bus().Emit("my-app.rows.inserted", fields(payload)["Table"])
+    return ctx, payload, nil
+})
+```
+
+Subscribers of `my-app.rows.inserted` run before `Emit` returns; their errors are logged and do not affect the
+handler.
 
 ---
 
@@ -227,15 +204,12 @@ Subscribers registered for `"my-app.record.inserted"` will be called synchronous
 
 | Pipeline | Handler error behaviour |
 |---|---|
-| `vdb.query.received.*` | Aborts pipeline, error propagated to `DriverAPI` caller. |
-| `vdb.write.insert.*` | Aborts pipeline, error propagated to `DriverAPI` caller. |
-| `vdb.write.update.*` | Aborts pipeline, error propagated to `DriverAPI` caller. |
-| `vdb.write.delete.*` | Aborts pipeline, error propagated to `DriverAPI` caller. |
-| `vdb.transaction.begin.*` | Aborts pipeline, error propagated to `DriverAPI` caller. |
-| `vdb.connection.opened.*` | Aborts pipeline, error propagated to `DriverAPI` caller. |
-| `vdb.connection.closed.*` | Logged; caller proceeds normally. |
-| `vdb.transaction.rollback.*` | Logged; caller proceeds normally. |
-| `vdb.records.merged.*` | Logged; original (pre-merge) records are returned to the driver. |
-| All event subscribers | Logged; remaining subscribers for the same event continue to run. |
-
-When a handler error is "logged and caller proceeds", the error is recorded at `WARN` level with the pipeline name, point name, and handler priority attached as structured fields.
+| `vdb.connection.opened.*` | The connection is refused; the error goes to the engine |
+| `vdb.query.received.*` | The statement fails with the error |
+| `vdb.transaction.begin.*` | The transaction is not opened |
+| `vdb.transaction.commit.*` | The commit fails |
+| `vdb.write.*` | The write fails |
+| `vdb.records.source.*`, `vdb.records.merged.*` | The read fails |
+| `vdb.transaction.rollback.*` | The rollback still happens; the error is returned to the engine |
+| `vdb.connection.closed.*` | Ignored; the connection is released |
+| All event subscribers | Logged; the other subscribers of the event still run |
