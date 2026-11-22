@@ -44,10 +44,11 @@ Every pipeline includes a `build_context` point as its first point. The framewor
 
 ### Payloads
 
-Each pipeline carries one payload struct from `internal/payloads`, passed by value; a handler returns the payload
-the next one receives. Out-of-process plugins receive and return the same payload as JSON with the same field names.
-Identifiers are `uint64`. Rows are `core.Row` (`[]core.Value`, the engine's bytes with a `Null` flag per column) in the
-order `Columns` names; the core never interprets them.
+Each pipeline carries one payload; a handler returns the payload the next one receives. Plugins are separate programs in any language: they receive each payload as a JSON object and return it, changed
+or not, as JSON with the same field names. Identifiers are integers. A row is an array of column values in the order
+`Columns` names; each value is a JSON string when its bytes are valid UTF-8, `null` for SQL `NULL`, and
+`{"base64": "..."}` otherwise. Inside the core the payloads are the structs of `internal/payloads`. The core never
+interprets row values.
 
 ---
 

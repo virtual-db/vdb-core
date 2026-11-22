@@ -129,9 +129,10 @@ app.Attach("vdb.query.received.intercept", 20, func(ctx any, payload any) (any, 
 
 ## Common handler patterns
 
-The payload is a struct of `internal/payloads` (fields in [pipelines.md](pipelines.md)). Code outside `vdb-core` cannot
-name those types, so it reads the payload by field name and may return it as a `map[string]any` with the same field
-names; the core decodes either form, as it does for out-of-process plugins. The helper below is used in the examples:
+These examples are in-process Go handlers, attached with `app.Attach` by the program that embeds the core. Plugins in
+any language do the same over JSON-RPC ([plugins.md](plugins.md)). A payload's fields are listed in
+[pipelines.md](pipelines.md); a Go handler reads them by name and may return the payload as a `map[string]any`, which
+the core decodes as it does a plugin's JSON reply. The helper below is used in the examples:
 
 ```go
 // fields returns the payload's fields by name.
