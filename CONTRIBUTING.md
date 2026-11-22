@@ -5,7 +5,7 @@
 >
 > VirtualDB is not currently accepting public pull requests. We intend to open the project to community contributions in the future — when we do, this document will be updated accordingly.
 >
-> **In the meantime, we encourage you to participate by [opening a GitHub Issue](https://github.com/virtual-db/core/issues).** Issues are the best way to report bugs, request features, ask questions, and start discussions with the team.
+> **In the meantime, we encourage you to participate by [opening a GitHub Issue](https://github.com/virtual-db/vdb-core/issues).** Issues are the best way to report bugs, request features, ask questions, and start discussions with the team.
 >
 > Thank you for your interest in VirtualDB.
 

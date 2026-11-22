@@ -12,8 +12,8 @@ VirtualDB core emits structured events over an internal event bus backed by [`gi
 
 The `EventFunc` signature:
 
-```/dev/null/example.go#L1-3
-type EventFunc func(ctx HandlerContext, payload any) error
+```go
+type EventFunc func(ctx any, payload any) error
 ```
 
 Handlers receive `payload any` and must type-assert it to the expected payload type for the event.
@@ -22,141 +22,32 @@ Handlers receive `payload any` and must type-assert it to the expected payload t
 
 ## Standard Events
 
-### `vdb.server.stopped`
+Plugins are separate programs in any language: they receive each payload as a JSON object and return it, changed
+or not, as JSON with the same field names. Identifiers are integers. A row is an array of column values in the order
+`Columns` names; each value is a JSON string when its bytes are valid UTF-8, `null` for SQL `NULL`, and
+`{"base64": "..."}` otherwise. Inside the core the payloads are the structs of `internal/payloads`.
 
-Emitted after `Server.Stop()` returns and all plugins have exited.
-
-**Payload:** none (`nil`).
-
----
-
-### `vdb.connection.opened`
-
-Emitted when a new client connection has been accepted and tracked.
-
-| Field | Type | Description |
+| Event | Emitted | Payload |
 |---|---|---|
-| `ConnectionID` | `uint32` | Unique ID assigned to the connection. |
-| `User` | `string` | Authenticated username. |
-| `Address` | `string` | Remote address of the client. |
+| `vdb.server.stopped` | After `Server.Stop` returns and every plugin has exited | `ServerStopPayload`: `Reason` |
+| `vdb.connection.opened` | After a client connection is accepted and tracked | `ConnectionOpenedPayload`: `ConnectionID`, `User`, `Address` |
+| `vdb.connection.closed` | After a client connection is released | `ConnectionClosedPayload`: `ConnectionID`, `User`, `Address` |
+| `vdb.transaction.started` | After a transaction opens | `TransactionBeginPayload`: `ConnectionID`, `ReadOnly` |
+| `vdb.transaction.committed` | After a commit is published | `TransactionCommitPayload`: `ConnectionID`, `Change` (the transaction's `*core.ChangeSet`) |
+| `vdb.transaction.rolledback` | After a rollback | `TransactionRollbackPayload`: `ConnectionID`, `Savepoint` (empty for a full rollback) |
+| `vdb.query.completed` | When the engine reports a finished statement | `QueryCompletedPayload`: `ConnectionID`, `Query`, `Digest`, `Database`, `Account`, `DurationMs`, `RowsAffected`, `RowsSent`, `ErrorCode` (0 on success) |
+| `vdb.record.inserted` | After rows land in the Delta through `vdb.write.insert` | `WriteInsertPayload`: `ConnectionID`, `Table`, `TableID`, `Columns`, `Rows`, `Images`, `Results` (one per row) |
+| `vdb.record.updated` | After an update lands through `vdb.write.update` | `WriteUpdatePayload`: `ConnectionID`, `Table`, `TableID`, `Columns`, `Old` (`core.RowRef`), `New`, `Images` |
+| `vdb.record.deleted` | After a delete lands through `vdb.write.delete` | `WriteDeletePayload`: `ConnectionID`, `Table`, `TableID`, `Old` (`core.RowRef`) |
+| `vdb.table.truncated` | After a truncate through `vdb.write.truncate` (the table is detached from the Source) | `WriteTruncatePayload`: `ConnectionID`, `Table`, `TableID` |
+| `vdb.schema.loaded` | When a table is added to the catalog of record | `SchemaPayload`: `Database`, `Table`, `TableID`, `Kind`, `Version`, `Columns` |
+| `vdb.schema.invalidated` | When a table is changed by the Source or by client DDL | `SchemaPayload`, as above |
+| `vdb.limit.reached` | When the memory or lock limit refuses work | `LimitReachedPayload`: `Limit`, `Value`, `ConnectionID` |
+| `vdb.key.conflict` | When a Source row is hidden by an equal Delta key | `KeyConflictPayload`: `Table`, `TableID`, `KeyImage` |
+| `vdb.source.requested` | Emitted by the engine after each Source request | `SourceRequestedPayload`: `ConnectionID`, `Digest`, `Shape`, `Table`, `DurationUs`, `Rows`, `Bytes`, `Error` |
+| `vdb.snapshot.expired` | Emitted by the engine when a Source snapshot expires | `SnapshotExpiredPayload`: `ConnectionID`, `AgeMs` |
 
----
-
-### `vdb.connection.closed`
-
-Emitted after a client connection has been released and cleaned up.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | ID of the connection that closed. |
-| `User` | `string` | Authenticated username. |
-| `Address` | `string` | Remote address of the client. |
-
----
-
-### `vdb.transaction.started`
-
-Emitted after a transaction has been successfully opened and a `TxDelta` allocated.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that opened the transaction. |
-| `ReadOnly` | `bool` | Whether the transaction is read-only. |
-
----
-
-### `vdb.transaction.committed`
-
-Emitted after a transaction's `TxDelta` has been merged into the live delta.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that committed the transaction. |
-
----
-
-### `vdb.transaction.rolledback`
-
-Emitted after a transaction's `TxDelta` has been discarded.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that rolled back. |
-| `Savepoint` | `string` | Savepoint name, or empty for a full rollback. |
-
----
-
-### `vdb.query.completed`
-
-Emitted after a query has been fully processed and a result returned to the driver.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that issued the query. |
-| `Query` | `string` | The (possibly rewritten) query string. |
-| `Database` | `string` | Target database name. |
-| `DurationMs` | `float64` | Wall-clock execution time in milliseconds. |
-| `RowsAffected` | `int64` | Number of rows affected or returned. |
-| `Error` | `string` | Stringified query error, or empty on success. |
-
----
-
-### `vdb.record.inserted`
-
-Emitted after a record has been routed to the live delta or `TxDelta` via `vdb.write.insert`.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that performed the insert. |
-| `Table` | `string` | Target table name. |
-| `Record` | `map[string]any` | The inserted record. |
-
----
-
-### `vdb.record.updated`
-
-Emitted after an overlay has been written and stable-key tracking updated via `vdb.write.update`.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that performed the update. |
-| `Table` | `string` | Target table name. |
-| `OldRecord` | `map[string]any` | Record state before the update. |
-| `NewRecord` | `map[string]any` | Record state after the update. |
-
----
-
-### `vdb.record.deleted`
-
-Emitted after a tombstone has been written and any prior update overlay removed via `vdb.write.delete`.
-
-| Field | Type | Description |
-|---|---|---|
-| `ConnectionID` | `uint32` | Connection that performed the delete. |
-| `Table` | `string` | Target table name. |
-| `Record` | `map[string]any` | The record that was deleted. |
-
----
-
-### `vdb.schema.loaded`
-
-Emitted when schema metadata for a table has been loaded or refreshed.
-
-| Field | Type | Description |
-|---|---|---|
-| `Table` | `string` | Table whose schema was loaded. |
-| `Columns` | `[]string` | Ordered list of column names. |
-| `PKCol` | `string` | Name of the primary key column. |
-
----
-
-### `vdb.schema.invalidated`
-
-Emitted when cached schema metadata for a table has been invalidated and must be re-fetched.
-
-| Field | Type | Description |
-|---|---|---|
-| `Table` | `string` | Table whose schema was invalidated. |
+The last two are declared by the core and emitted by the engine through `DriverAPI.Emit`, as any engine may.
 
 ---
 
@@ -166,7 +57,7 @@ Emitted when cached schema metadata for a table has been invalidated and must be
 
 Declare the event before any subscriber or emitter can use it. Declaration is typically done during plugin or product initialisation.
 
-```/dev/null/example.go#L1-10
+```go
 // Declare the event once, e.g. in plugin initialisation.
 app.DeclareEvent("myplugin.cache.evicted")
 
@@ -179,8 +70,8 @@ app.Emit("myplugin.cache.evicted", MyCacheEvictedPayload{
 
 Subscribe from any other component:
 
-```/dev/null/example.go#L1-7
-app.Subscribe("myplugin.cache.evicted", func(ctx HandlerContext, payload any) error {
+```go
+app.Subscribe("myplugin.cache.evicted", func(ctx any, payload any) error {
     p := payload.(MyCacheEvictedPayload)
     log.Printf("cache evicted %d keys from table %s", p.KeyCount, p.Table)
     return nil
@@ -193,7 +84,7 @@ There is no requirement that custom event names begin with `vdb.`.
 
 Plugins that run as out-of-process JSON-RPC servers must declare any events they intend to emit inside their `declare` notification payload, under the `"events"` key. The framework registers those names at plugin load time so that subsequent `emit_event` calls are accepted.
 
-```/dev/null/example.go#L1-14
+```jsonc
 // declare notification payload (sent by the plugin at startup)
 {
     "events": [

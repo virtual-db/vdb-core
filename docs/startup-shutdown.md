@@ -47,12 +47,12 @@ The `vdb.server.start` pipeline executes through the following points in order:
 
 | Point | Description |
 |---|---|
-| `build_context` | Prepares the server start context. |
-| `configure` | Handlers may inspect or adjust server configuration before launch. |
+| `build_context` | Creates the `ServerStartPayload`. |
+| `configure` | A persistence plugin attaches below 10 and returns its change sets in the payload's `Restore` field; at priority 10 the framework replays them in order. A change set that fails to apply is logged and skipped. |
 | `launch` | At priority 10, the framework calls `Server.Run()` in a new goroutine. Errors from `Run()` are forwarded on an internal error channel. |
-| `emit` | The `vdb.server.started` event is emitted on the event bus. |
+| `emit` | Post-launch notification. No built-in handler and no event. |
 
-If any handler in this pipeline returns an error, `Run` triggers `Stop()` and returns the handler error.
+If any handler in this pipeline returns an error, `Run` returns that error.
 
 ### Step 4: Idle Loop
 
