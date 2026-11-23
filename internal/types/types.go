@@ -198,6 +198,16 @@ type Cursor interface {
 	Close() error
 }
 
+// LookupCursor yields a lookup's rows, each with the index of the key it
+// answers in Batch.KeyIdx: the Delta's answers first, then the Source's, one
+// key batch at a time.
+type LookupCursor interface {
+	Cursor
+	// Shadows is the shadow set to apply to Source rows when the table needs
+	// one (TableDef.ShadowsNeeded), known before the first Next; else nil.
+	Shadows() []KeyImage
+}
+
 // Batch is a group of rows with what update_row and delete_row will send back.
 type Batch struct {
 	Rows   []Row
@@ -220,7 +230,10 @@ type SourceSnapshot interface {
 	// Start opens the consistent snapshot on the reserved connection.
 	Start() error
 	Scan(req SourceScan) (SourceCursor, error)
-	Lookup(t TableID, idx IndexID, keys []Key, cols ColumnSet) (SourceRows, error)
+	// Lookup reads the rows of keys as a cursor; each row's KeyIdx is the
+	// index in keys of the key it answers. A key with many rows may span
+	// several Next calls.
+	Lookup(t TableID, idx IndexID, keys []Key, cols ColumnSet) (SourceCursor, error)
 	Exists(t TableID, keys []SourceKey) ([]bool, error)
 	Count(t TableID) (uint64, error)
 	ByColumns(t TableID, cols ColumnSet, values []Row, want ColumnSet) (SourceCursor, error)
