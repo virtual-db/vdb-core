@@ -114,6 +114,12 @@ type StmtContext struct {
 type ReadLocks struct {
 	Row     func(t TableID, key KeyImage) error
 	Missing func(t TableID, idx IndexID, img KeyImage) error
+	// Probe, when set, is called for every row Row locked, once the read has
+	// settled on the version it returns. row holds the values of cols, or of
+	// every column when cols is nil (Delta rows). The engine uses it to wait
+	// for locks other transactions hold on the row's index entries, which
+	// the row's record lock does not see (vdb-mysql-engine#6).
+	Probe func(t TableID, row Row, cols ColumnSet) error
 }
 
 // LockKey is the lock key of a row: its Source key bytes when it has them,

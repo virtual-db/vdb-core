@@ -255,3 +255,33 @@ func BenchmarkAcquire(b *testing.B) {
 		})
 	}
 }
+
+// TestRangeIndexes: the indexes of a table on which another transaction
+// holds a range or whole-index lock (vdb-mysql-engine#6).
+func TestRangeIndexes(t *testing.T) {
+	m := newM(nil)
+	idx := func(r types.Resource, i types.IndexID) types.Resource { r.Index = i; return r }
+	if got := m.RangeIndexes(2, 1); len(got) != 0 {
+		t.Fatalf("empty table: %v", got)
+	}
+	m.Acquire(w(1), idx(rg("b", "d"), 3), S)
+	m.Acquire(w(1), idx(pt("x"), 4), X) // a point lock is not a range
+	m.Acquire(w(2), idx(rg("m", "p"), 1), S)
+	m.Acquire(w(1), types.Resource{Table: 2, Index: 5, Whole: true}, X)
+	if got := fmt.Sprint(m.RangeIndexes(2, 1)); got != "[3]" {
+		t.Fatalf("for tx 2: %s, want [3]", got)
+	}
+	if got := fmt.Sprint(m.RangeIndexes(1, 1)); got != "[1]" {
+		t.Fatalf("for tx 1: %s, want [1] (its own ranges do not count)", got)
+	}
+	if got := fmt.Sprint(m.RangeIndexes(9, 1)); got != "[1 3]" {
+		t.Fatalf("for tx 9: %s, want [1 3]", got)
+	}
+	if got := fmt.Sprint(m.RangeIndexes(9, 2)); got != "[5]" {
+		t.Fatalf("whole-index lock on table 2: %s, want [5]", got)
+	}
+	m.ReleaseAll(1)
+	if got := fmt.Sprint(m.RangeIndexes(2, 1)); got != "[]" {
+		t.Fatalf("after release: %s", got)
+	}
+}

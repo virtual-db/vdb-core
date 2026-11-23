@@ -110,6 +110,9 @@ func (m *Merge) addDelta(tx *txn.Tx, d *types.TableDef, b *types.Batch, r *delta
 			return nil
 		}
 		r = latest
+		if err := probe(lk, d.ID, r.Row, nil); err != nil {
+			return err
+		}
 	}
 	b.Rows = append(b.Rows, types.Project(r.Row, cols))
 	b.Refs = append(b.Refs, deltaRef(r, whole))

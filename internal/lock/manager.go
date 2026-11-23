@@ -243,6 +243,29 @@ func (m *Manager) Covered(tx uint64, r types.Resource, mode types.LockMode) bool
 	return found
 }
 
+// RangeIndexes returns, in index order, the indexes of table t on which a
+// transaction other than tx holds a range or whole-index lock.
+func (m *Manager) RangeIndexes(tx uint64, t types.TableID) []types.IndexID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []types.IndexID
+	for s, rs := range m.ranges {
+		if s.table != t || rs == nil || rs.n == 0 {
+			continue
+		}
+		other := false
+		rs.each(func(e *entry) bool {
+			other = e.tx != tx
+			return !other
+		})
+		if other {
+			out = append(out, s.index)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // contains reports whether held, a range or whole index, contains all of r.
 func contains(held, r types.Resource) bool {
 	switch {

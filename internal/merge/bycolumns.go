@@ -53,6 +53,10 @@ func (m *Merge) ByColumns(tx *txn.Tx, t types.TableID, idx types.IndexID, img ty
 					continue
 				}
 				row = latest
+				if err := probe(lk, t, row.Row, nil); err != nil {
+					it.Close()
+					return out, err
+				}
 			}
 			out.Rows = append(out.Rows, types.Project(row.Row, want))
 			out.Refs = append(out.Refs, deltaRef(row, whole))

@@ -56,6 +56,10 @@ type Locks interface {
 	// Release drops the locks the session took on exactly r after mark; a
 	// lock on r held at or before mark stays (READ COMMITTED unlock_row).
 	Release(s Session, r Resource, mark LockMark)
+	// RangeIndexes returns the indexes of table t on which a transaction
+	// other than the session's holds a range or whole-index lock, so an
+	// engine probes only those (and nothing when the list is empty).
+	RangeIndexes(s Session, t TableID) []IndexID
 }
 
 // Session is one client connection's view of the core. Used by one goroutine

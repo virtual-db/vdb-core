@@ -10,6 +10,7 @@ package core_test
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strconv"
@@ -438,5 +439,67 @@ func TestByColumns(t *testing.T) {
 	}
 	if len(b.Rows) != 1 || string(b.Rows[0][0].B) != "21" {
 		t.Fatalf("children of user 3: %v, want the Delta row 21", b.Rows)
+	}
+}
+
+// TestReadLocksProbe: a locking read calls Probe for every row it locks,
+// with the version it returns; Source rows come with the read's columns,
+// Delta rows with every column (vdb-mysql-engine#6). RangeIndexes names the
+// indexes on which other transactions hold ranges.
+func TestReadLocksProbe(t *testing.T) {
+	e := newEnv(t)
+	e.defineLocks()
+	a, b := e.session(1), e.session(2)
+	stmt(t, a, core.PerTransaction)
+	stmt(t, b, core.PerTransaction)
+	if err := e.lockRow(a, srcRef(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Update(e.users, srcRef(2), row(2, "bo"), images(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	stmt(t, a, core.PerTransaction)
+	var probed []string
+	lk := &core.ReadLocks{
+		Row: func(tb core.TableID, key core.KeyImage) error {
+			return e.api.Locks().Acquire(a, core.Resource{Table: tb, Point: key}, lockS, nil)
+		},
+		Probe: func(tb core.TableID, r core.Row, cols core.ColumnSet) error {
+			probed = append(probed, fmt.Sprintf("%s:%s cols=%v", r[0].B, r[len(r)-1].B, cols))
+			return nil
+		},
+	}
+	h, err := a.Scan(core.ScanRequest{Table: e.users, Columns: core.ColumnSet{0, 1}, Locks: lk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, err := h.Merged().Next(100, 0)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.Close()
+	sort.Strings(probed)
+	equal(t, probed, "1:ann cols=[0 1]", "2:bo cols=[]", "3:cid cols=[0 1]")
+
+	// Ranges: b holds one on index 0 of users; a sees it, b does not.
+	if err := e.api.Locks().Acquire(b, core.Resource{Table: e.users, Index: 0, Range: &core.ImageRange{Low: img(1), High: img(2), LowIncl: true, HighIncl: true}}, lockS, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(e.api.Locks().RangeIndexes(a, e.users)); got != "[0]" {
+		t.Fatalf("RangeIndexes for a: %s", got)
+	}
+	if got := fmt.Sprint(e.api.Locks().RangeIndexes(b, e.users)); got != "[]" {
+		t.Fatalf("RangeIndexes for b: %s", got)
+	}
+	if got := fmt.Sprint(e.api.Locks().RangeIndexes(a, e.orders)); got != "[]" {
+		t.Fatalf("RangeIndexes for orders: %s", got)
 	}
 }
