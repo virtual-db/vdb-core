@@ -90,6 +90,14 @@ func (l locks) Covered(s types.Session, r types.Resource, mode types.LockMode) b
 	return false
 }
 
+func (l locks) RangeIndexes(s types.Session, t types.TableID) []types.IndexID {
+	var tx uint64
+	if ss, ok := s.(*session.Session); ok {
+		tx = ss.TxID()
+	}
+	return l.m.RangeIndexes(tx, t)
+}
+
 func (l locks) Release(s types.Session, r types.Resource, mark types.LockMark) {
 	if ss, ok := s.(*session.Session); ok && ss.TxID() != 0 {
 		l.m.Release(ss.TxID(), r, mark)

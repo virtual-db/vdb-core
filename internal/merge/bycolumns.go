@@ -103,6 +103,10 @@ func (c *byColumnsCursor) Next(maxRows, maxBytes int) (types.Batch, error) {
 				continue
 			}
 			row = latest
+			if err := probe(c.lk, c.d.ID, row.Row, nil); err != nil {
+				c.Close()
+				return types.Batch{}, err
+			}
 		}
 		out.Rows = append(out.Rows, types.Project(row.Row, c.want))
 		out.Refs = append(out.Refs, deltaRef(row, c.whole))

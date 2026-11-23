@@ -195,6 +195,18 @@ func merge(a, b *inode) *inode {
 	return b
 }
 
+// each calls fn for every entry in start order, until fn returns false.
+func (t *itree) each(fn func(*entry) bool) {
+	var walk func(n *inode) bool
+	walk = func(n *inode) bool {
+		if n == nil {
+			return true
+		}
+		return walk(n.left) && fn(n.e) && walk(n.right)
+	}
+	walk(t.root)
+}
+
 // overlapping calls fn for every entry whose span overlaps [lo, hi), until fn
 // returns false.
 func (t *itree) overlapping(lo string, hi bound, fn func(*entry) bool) {

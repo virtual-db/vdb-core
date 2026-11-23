@@ -263,10 +263,16 @@ func (m *Merge) filterSourceIdx(tx *txn.Tx, d *types.TableDef, view *delta.Table
 				if !ok {
 					continue // deleted
 				}
+				if err := probe(lk, d.ID, dr.Row, nil); err != nil {
+					return types.Batch{}, nil, err
+				}
 				b.Rows = append(b.Rows, types.Project(dr.Row, cols))
 				b.Refs = append(b.Refs, deltaRef(dr, false))
 				orig = append(orig, i)
 				continue
+			}
+			if err := probe(lk, d.ID, row, cols); err != nil {
+				return types.Batch{}, nil, err
 			}
 		}
 		b.Rows = append(b.Rows, row)
@@ -361,6 +367,9 @@ func (c *deltaCursor) Next(maxRows, maxBytes int) (types.Batch, error) {
 				continue
 			}
 			r = latest
+			if err := probe(c.req.Locks, c.d.ID, r.Row, nil); err != nil {
+				return types.Batch{}, err
+			}
 		}
 		row := types.Project(r.Row, c.req.Columns)
 		b.Rows = append(b.Rows, row)
@@ -384,4 +393,12 @@ func (c *deltaCursor) Close() error {
 		it.Close()
 	}
 	return nil
+}
+
+// probe runs lk.Probe, when set, for a row the read just locked.
+func probe(lk *types.ReadLocks, t types.TableID, row types.Row, cols types.ColumnSet) error {
+	if lk == nil || lk.Probe == nil {
+		return nil
+	}
+	return lk.Probe(t, row, cols)
 }
