@@ -104,7 +104,7 @@ type DriverAPI interface {
 }
 
 // Session: statements, transactions and savepoints; Scan, Lookup, ByColumns, Count;
-// Insert, Update, Delete, Truncate; staged DDL; LockMark; End.
+// Insert, Update, Delete, Truncate, DeleteAll; staged DDL; LockMark; End.
 // See types.go and internal/types/api.go for every signature.
 ```
 

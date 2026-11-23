@@ -73,7 +73,7 @@ the built-in handler that stamps a fresh `CorrelationID`.
 | `vdb.write.insert` | `Session.Insert` | `apply` (10): rows go into the Delta and `Results` is filled; `emit` (10): `vdb.record.inserted` | `WriteInsertPayload`: `ConnectionID`, `Table`, `TableID`, `Columns`, `Rows`, `Images`, `Results` |
 | `vdb.write.update` | `Session.Update` | `apply` (10); `emit` (10): `vdb.record.updated` | `WriteUpdatePayload`: `ConnectionID`, `Table`, `TableID`, `Columns`, `Old core.RowRef`, `New`, `Images` |
 | `vdb.write.delete` | `Session.Delete` | `apply` (10); `emit` (10): `vdb.record.deleted` | `WriteDeletePayload`: `ConnectionID`, `Table`, `TableID`, `Old core.RowRef` |
-| `vdb.write.truncate` | `Session.Truncate` | `apply` (10): the table is detached from the Source and its Delta emptied; `emit` (10): `vdb.table.truncated` | `WriteTruncatePayload`: `ConnectionID`, `Table`, `TableID` |
+| `vdb.write.truncate` | `Session.Truncate`, `Session.DeleteAll` | `apply` (10): the table is detached from the Source and its Delta emptied (for `DeleteAll`, a DELETE without WHERE, only as a Delta change that rollback undoes, with no catalog change); `emit` (10): `vdb.table.truncated` | `WriteTruncatePayload`: `ConnectionID`, `Table`, `TableID`, `Delete`, `Rows` |
 
 Host-only pipelines run when no plugin can be connected yet (`vdb.context.create`) or as part of the plugins'
 own shutdown (`vdb.server.stop`); plugins cannot attach to them. Every other pipeline accepts plugin handlers.

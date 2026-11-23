@@ -474,6 +474,33 @@ func (s *Session) Truncate(t types.TableID) error {
 	return types.AsErrorOrNil(err)
 }
 
+// DeleteAll empties the table for a DELETE without WHERE (SD-1) and returns
+// how many rows it deleted. It runs vdb.write.truncate with Delete set.
+func (s *Session) DeleteAll(t types.TableID) (uint64, bool, error) {
+	tx, err := s.needTx()
+	if err != nil {
+		return 0, false, err
+	}
+	d, ok := tx.Def(t)
+	if !ok {
+		return 0, false, &types.Error{Code: types.ErrRefused, Table: t, Msg: "unknown table"}
+	}
+	if d.Kind == types.Provided {
+		return 0, true, nil
+	}
+	n, declined, err := s.deps().Merge.Count(tx, t)
+	if err != nil || declined {
+		return 0, declined, types.AsErrorOrNil(err)
+	}
+	name, _ := s.tableName(tx, t)
+	_, err = s.deps().Runner.Process(points.PipelineWriteTruncate, payloads.WriteTruncatePayload{
+		ConnectionID: s.info.ConnID, Table: name, TableID: t, Delete: true, Rows: n})
+	if err != nil {
+		return 0, false, types.AsError(err)
+	}
+	return n, false, nil
+}
+
 // ApplyDDL stages a client DDL change.
 func (s *Session) ApplyDDL(c types.CatalogChange) (types.TableID, error) {
 	c.Source = false

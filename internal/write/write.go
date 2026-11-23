@@ -438,6 +438,18 @@ func (w *Writer) Delete(tx *txn.Tx, t types.TableID, old types.RowRef) error {
 
 // Truncate detaches a mirrored table and clears its Delta rows and touched
 // keys; the change is recorded in the change set (doc 05 §2.3).
+// DeleteAll empties table t for a DELETE without WHERE (SD-1): the same
+// Delta change as Truncate, which hides the Source and is undone by statement
+// or transaction rollback, but no catalog change, so the table keeps its kind
+// and version (and the engine its AUTO_INCREMENT).
+func (w *Writer) DeleteAll(tx *txn.Tx, t types.TableID) error {
+	d, err := def(tx, t)
+	if err != nil {
+		return err
+	}
+	return tx.Apply(delta.Op{Kind: delta.OpTruncate, Table: t, TKind: d.Kind, Version: d.Version})
+}
+
 func (w *Writer) Truncate(tx *txn.Tx, t types.TableID) error {
 	d, err := def(tx, t)
 	if err != nil {

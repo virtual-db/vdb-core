@@ -466,6 +466,78 @@ func TestByColumns(t *testing.T) {
 	}
 }
 
+// ── DELETE without WHERE (issue #18, SD-1) ──
+
+func deltaEntries(e *env, tb core.TableID) int {
+	n := 0
+	e.api.Delta().Rows(tb, func(core.DeltaRowInfo) bool { n++; return true })
+	e.api.Delta().Touched(tb, func(core.TouchedInfo) bool { n++; return true })
+	return n
+}
+
+func TestDeleteAllDetachesTransactionally(t *testing.T) {
+	e := newEnv(t)
+	s := e.session(1)
+	before, _ := e.api.Catalog().Table(e.users)
+
+	// One Delta row, one changed Source row: 4 rows in all.
+	stmt(t, s, core.PerTransaction)
+	s.Insert(e.users, []core.Row{row(4, "dan")}, [][]core.KeyImage{images(4)})
+	if err := s.Update(e.users, srcRef(2), row(2, "bobby"), images(2)); err != nil {
+		t.Fatal(err)
+	}
+	s.StmtEnd()
+
+	// Statement rollback brings every row back.
+	stmt(t, s, core.PerTransaction)
+	n, declined, err := s.DeleteAll(e.users)
+	if err != nil || declined || n != 4 {
+		t.Fatalf("DeleteAll = %d %v %v, want 4 rows", n, declined, err)
+	}
+	equal(t, scanAll(t, s, e.users))
+	if err := s.StmtRollback(); err != nil {
+		t.Fatal(err)
+	}
+	stmt(t, s, core.PerTransaction)
+	equal(t, scanAll(t, s, e.users), "1:ann", "2:bobby", "3:cid", "4:dan")
+	s.StmtEnd()
+
+	// Transaction rollback too.
+	stmt(t, s, core.PerTransaction)
+	if _, _, err := s.DeleteAll(e.users); err != nil {
+		t.Fatal(err)
+	}
+	s.StmtEnd()
+	if err := s.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	stmt(t, s, core.PerTransaction)
+	equal(t, scanAll(t, s, e.users), "1:ann", "2:bob", "3:cid")
+
+	// Committed: no per-row Delta entries, no catalog change, and rows
+	// inserted afterwards are the only ones.
+	if _, _, err := s.DeleteAll(e.users); err != nil {
+		t.Fatal(err)
+	}
+	s.Insert(e.users, []core.Row{row(9, "z")}, [][]core.KeyImage{images(9)})
+	if err := s.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := deltaEntries(e, e.users); got != 1 {
+		t.Fatalf("%d Delta entries, want 1 (row 9)", got)
+	}
+	after, _ := e.api.Catalog().Table(e.users)
+	if after.Kind != core.Mirrored || after.Version != before.Version {
+		t.Fatalf("catalog changed: kind %v version %d -> %d", after.Kind, before.Version, after.Version)
+	}
+	s2 := e.session(2)
+	stmt(t, s2, core.PerTransaction)
+	equal(t, scanAll(t, s2, e.users), "9:z")
+	if n, declined, err := s2.Count(e.users); err != nil || declined || n != 1 {
+		t.Fatalf("count = %d %v %v", n, declined, err)
+	}
+}
+
 // ── lookups and column reads as cursors (issue #17) ──
 
 func drain(t *testing.T, c core.Cursor, maxRows int) (core.Batch, int) {
