@@ -37,6 +37,7 @@ type (
 	SourceScan        = types.SourceScan
 	WriteResult       = types.WriteResult
 	Cursor            = types.Cursor
+	LookupCursor      = types.LookupCursor
 	Batch             = types.Batch
 	Source            = types.Source
 	SourceSnapshot    = types.SourceSnapshot
