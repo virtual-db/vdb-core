@@ -77,6 +77,13 @@ type Session interface {
 	Update(t TableID, old RowRef, row Row, images []KeyImage) error
 	Delete(t TableID, old RowRef) error
 	Truncate(t TableID) error
+	// DeleteAll is a DELETE without WHERE (SD-1): the table is detached like
+	// TRUNCATE, but as a Delta change that statement and transaction rollback
+	// undo, with no catalog change, so the engine keeps AUTO_INCREMENT. It
+	// returns the rows deleted, the table's exact row count. declined means
+	// the count was declined (too many shadowed keys): nothing was changed
+	// and the engine deletes row by row.
+	DeleteAll(t TableID) (deleted uint64, declined bool, err error)
 
 	// DDL, staged in the transaction so it commits with the engine's own DDL.
 	ApplyDDL(c CatalogChange) (TableID, error)

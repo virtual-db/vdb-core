@@ -19,7 +19,8 @@ the reference: one `Driver` built from its `Config` and the core's `DriverAPI`.
    the engine's own definitions as opaque bytes, and objects.
 2. Open one `Session` per database connection with `DriverAPI().OpenSession`.
 3. Per statement: `StmtBegin` (with the snapshot timing and read view the engine's isolation rules ask for), then
-   reads (`Scan`, `Lookup`, `ByColumns`, `Count`) and writes (`Insert`, `Update`, `Delete`, `Truncate`), then `StmtEnd`
+   reads (`Scan`, `Lookup`, `ByColumns`, `Count`) and writes (`Insert`, `Update`, `Delete`, `Truncate`, and `DeleteAll` for a
+   DELETE without WHERE), then `StmtEnd`
    or `StmtRollback`; per transaction `Commit` or `Rollback`; `Savepoint`, `RollbackTo`, `Release`; `Snapshot` for a
    consistent snapshot now.
 4. Take the locks its rules require with `Locks().Acquire(session, resource, mode, wait)`, passing a `ReadLocks` to a

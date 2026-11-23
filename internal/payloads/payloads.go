@@ -84,6 +84,11 @@ type WriteTruncatePayload struct {
 	ConnectionID uint64
 	Table        string
 	TableID      types.TableID
+	// Delete marks a DELETE without WHERE (SD-1): the table is emptied as a
+	// rollback-able Delta change, with no catalog change. Rows is how many
+	// rows it deleted.
+	Delete bool
+	Rows   uint64
 }
 
 // TransactionBeginPayload is the payload of vdb.transaction.begin.
