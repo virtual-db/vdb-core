@@ -315,27 +315,46 @@ func (s *Session) closeScans() {
 }
 
 // Lookup answers keys; the second result is the shadow set for Source rows.
-func (s *Session) Lookup(t types.TableID, idx types.IndexID, keys []types.Key, cols types.ColumnSet, lk *types.ReadLocks) (types.Batch, []types.KeyImage, error) {
+func (s *Session) Lookup(t types.TableID, idx types.IndexID, keys []types.Key, cols types.ColumnSet, lk *types.ReadLocks) (types.LookupCursor, error) {
 	tx, err := s.needTx()
 	if err != nil {
-		return types.Batch{}, nil, err
+		return nil, err
 	}
-	r, err := s.deps().Merge.Lookup(tx, t, idx, keys, cols, lk)
+	c, err := s.deps().Merge.Lookup(tx, t, idx, keys, cols, lk)
 	if err != nil {
-		return types.Batch{}, nil, types.AsError(err)
+		return nil, types.AsError(err)
 	}
-	return r.Batch, r.Shadows, nil
+	return asCoreErrors{c}, nil
+}
+
+// asCoreErrors turns the merge's errors into *types.Error for the engine.
+type asCoreErrors struct{ types.LookupCursor }
+
+func (c asCoreErrors) Next(maxRows, maxBytes int) (types.Batch, error) {
+	b, err := c.LookupCursor.Next(maxRows, maxBytes)
+	if err != nil && err != io.EOF {
+		err = types.AsError(err)
+	}
+	return b, err
 }
 
 // ByColumns reads the merged rows whose columns equal values.
-func (s *Session) ByColumns(t types.TableID, idx types.IndexID, img types.KeyImage, cols types.ColumnSet, values types.Row, want types.ColumnSet, lk *types.ReadLocks) (types.Batch, error) {
+func (s *Session) ByColumns(t types.TableID, idx types.IndexID, img types.KeyImage, cols types.ColumnSet, values types.Row, want types.ColumnSet, lk *types.ReadLocks) (types.Cursor, error) {
 	tx, err := s.needTx()
 	if err != nil {
-		return types.Batch{}, err
+		return nil, err
 	}
-	b, err := s.deps().Merge.ByColumns(tx, t, idx, img, cols, values, want, lk)
-	return b, types.AsErrorOrNil(err)
+	c, err := s.deps().Merge.ByColumns(tx, t, idx, img, cols, values, want, lk)
+	if err != nil {
+		return nil, types.AsError(err)
+	}
+	return asCoreErrors{plainLookup{c}}, nil
 }
+
+// plainLookup gives a Cursor the LookupCursor shape, with no shadows.
+type plainLookup struct{ types.Cursor }
+
+func (plainLookup) Shadows() []types.KeyImage { return nil }
 
 // LockMark returns the position in the session's lock list.
 func (s *Session) LockMark() types.LockMark {

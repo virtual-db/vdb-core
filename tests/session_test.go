@@ -30,6 +30,7 @@ type fakeSource struct {
 	mu        sync.Mutex
 	tables    map[core.TableID]*fakeTable
 	snapshots int
+	asked     [][]int // keys of each Source Lookup, in order
 }
 
 func (f *fakeSource) Reserve(core.SessionInfo, core.StmtContext) (core.SourceSnapshot, error) {
@@ -37,7 +38,7 @@ func (f *fakeSource) Reserve(core.SessionInfo, core.StmtContext) (core.SourceSna
 	defer f.mu.Unlock()
 	f.snapshots++
 	// Copy the tables: the snapshot sees the Source as it is now.
-	snap := &fakeSnap{tables: map[core.TableID]map[int]core.Row{}}
+	snap := &fakeSnap{src: f, tables: map[core.TableID]map[int]core.Row{}}
 	for id, t := range f.tables {
 		m := map[int]core.Row{}
 		for k, r := range t.rows {
@@ -49,6 +50,7 @@ func (f *fakeSource) Reserve(core.SessionInfo, core.StmtContext) (core.SourceSna
 }
 
 type fakeSnap struct {
+	src    *fakeSource
 	tables map[core.TableID]map[int]core.Row
 }
 
@@ -84,17 +86,35 @@ func (s *fakeSnap) Scan(req core.SourceScan) (core.SourceCursor, error) {
 	return &fakeCursor{sr: sr}, nil
 }
 
-func (s *fakeSnap) Lookup(t core.TableID, _ core.IndexID, keys []core.Key, cols core.ColumnSet) (core.SourceRows, error) {
+// Lookup answers keys on the primary key (index 0), or on column 1 compared
+// as a decimal number (index 1): several rows per key.
+func (s *fakeSnap) Lookup(t core.TableID, idx core.IndexID, keys []core.Key, cols core.ColumnSet) (core.SourceCursor, error) {
 	var sr core.SourceRows
+	var asked []int
 	for i, k := range keys {
 		n := int(binary.BigEndian.Uint64(k.Image))
-		if r, ok := s.tables[t][n]; ok {
-			sr.Rows = append(sr.Rows, core.Project(r, cols))
-			sr.Keys = append(sr.Keys, key(n))
-			sr.KeyIdx = append(sr.KeyIdx, uint32(i))
+		asked = append(asked, n)
+		if idx == 0 {
+			if r, ok := s.tables[t][n]; ok {
+				sr.Rows = append(sr.Rows, core.Project(r, cols))
+				sr.Keys = append(sr.Keys, key(n))
+				sr.KeyIdx = append(sr.KeyIdx, uint32(i))
+			}
+			continue
+		}
+		for _, id := range s.sorted(t) {
+			r := s.tables[t][id]
+			if string(r[1].B) == strconv.Itoa(n) {
+				sr.Rows = append(sr.Rows, core.Project(r, cols))
+				sr.Keys = append(sr.Keys, key(id))
+				sr.KeyIdx = append(sr.KeyIdx, uint32(i))
+			}
 		}
 	}
-	return sr, nil
+	s.src.mu.Lock()
+	s.src.asked = append(s.src.asked, asked)
+	s.src.mu.Unlock()
+	return &fakeCursor{sr: sr}, nil
 }
 
 func (s *fakeSnap) Exists(t core.TableID, keys []core.SourceKey) ([]bool, error) {
@@ -132,17 +152,30 @@ func (s *fakeSnap) ByColumns(t core.TableID, cols core.ColumnSet, values []core.
 func (s *fakeSnap) Close() error { return nil }
 func (s *fakeSnap) Start() error { return nil }
 
+// fakeCursor returns its rows maxRows at a time, as a paging Source would.
 type fakeCursor struct {
-	sr   core.SourceRows
-	done bool
+	sr core.SourceRows
+	i  int
 }
 
-func (c *fakeCursor) Next(int) (core.SourceRows, error) {
-	if c.done {
+func (c *fakeCursor) Next(maxRows int) (core.SourceRows, error) {
+	if c.i >= len(c.sr.Rows) {
 		return core.SourceRows{}, io.EOF
 	}
-	c.done = true
-	return c.sr, nil
+	end := len(c.sr.Rows)
+	if maxRows > 0 && c.i+maxRows < end {
+		end = c.i + maxRows
+	}
+	var out core.SourceRows
+	out.Rows = c.sr.Rows[c.i:end]
+	if len(c.sr.Keys) > 0 {
+		out.Keys = c.sr.Keys[c.i:end]
+	}
+	if len(c.sr.KeyIdx) > 0 {
+		out.KeyIdx = c.sr.KeyIdx[c.i:end]
+	}
+	c.i = end
+	return out, nil
 }
 func (c *fakeCursor) Close() error { return nil }
 
@@ -278,10 +311,7 @@ func TestMergeRuleAndCount(t *testing.T) {
 	if err != nil || declined || n != 3 {
 		t.Fatalf("count = %d %v %v", n, declined, err)
 	}
-	b, _, err := s.Lookup(e.users, 0, []core.Key{{Image: img(1)}, {Image: img(2)}, {Image: img(3)}, {Image: img(4)}}, core.ColumnSet{1}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	b := lookupAll(t, s, e.users, 0, []core.Key{{Image: img(1)}, {Image: img(2)}, {Image: img(3)}, {Image: img(4)}}, core.ColumnSet{1}, nil, 2)
 	var got []string
 	for i, r := range b.Rows {
 		got = append(got, strconv.Itoa(int(b.KeyIdx[i]))+"="+string(r[0].B))
@@ -425,18 +455,172 @@ func TestByColumns(t *testing.T) {
 	if res, err := s.Insert(e.orders, []core.Row{row(21, "3")}, [][]core.KeyImage{{img(21), img(3)}}); err != nil || res[0].Err != nil {
 		t.Fatalf("insert: %v %v", err, res)
 	}
-	b, err := s.ByColumns(e.orders, 1, img(1), core.ColumnSet{1}, core.Row{{B: []byte("1")}}, core.ColumnSet{0, 1}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	b := byColumnsAll(t, s, e.orders, 1, img(1), core.Row{{B: []byte("1")}}, nil)
 	if len(b.Rows) != 2 {
 		t.Fatalf("children of user 1: %d rows, want 2 (Source rows 10 and 11)", len(b.Rows))
 	}
-	b, err = s.ByColumns(e.orders, 1, img(3), core.ColumnSet{1}, core.Row{{B: []byte("3")}}, core.ColumnSet{0, 1}, nil)
+	b = byColumnsAll(t, s, e.orders, 1, img(3), core.Row{{B: []byte("3")}}, nil)
+	if len(b.Rows) != 1 || string(b.Rows[0][0].B) != "21" {
+		t.Fatalf("children of user 3: %v, want the Delta row 21", b.Rows)
+	}
+}
+
+// ── lookups and column reads as cursors (issue #17) ──
+
+func drain(t *testing.T, c core.Cursor, maxRows int) (core.Batch, int) {
+	t.Helper()
+	var all core.Batch
+	calls := 0
+	for {
+		b, err := c.Next(maxRows, 0)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls++
+		if len(b.Rows) > maxRows {
+			t.Fatalf("Next(%d) returned %d rows", maxRows, len(b.Rows))
+		}
+		all.Rows = append(all.Rows, b.Rows...)
+		all.Refs = append(all.Refs, b.Refs...)
+		all.KeyIdx = append(all.KeyIdx, b.KeyIdx...)
+	}
+	c.Close()
+	return all, calls
+}
+
+func lookupAll(t *testing.T, s core.Session, tb core.TableID, idx core.IndexID, keys []core.Key, cols core.ColumnSet, lk *core.ReadLocks, maxRows int) core.Batch {
+	t.Helper()
+	c, err := s.Lookup(tb, idx, keys, cols, lk)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b.Rows) != 1 || string(b.Rows[0][0].B) != "21" {
-		t.Fatalf("children of user 3: %v, want the Delta row 21", b.Rows)
+	b, _ := drain(t, c, maxRows)
+	return b
+}
+
+func byColumnsAll(t *testing.T, s core.Session, tb core.TableID, idx core.IndexID, im core.KeyImage, vals core.Row, lk *core.ReadLocks) core.Batch {
+	t.Helper()
+	c, err := s.ByColumns(tb, idx, im, core.ColumnSet{1}, vals, core.ColumnSet{0, 1}, lk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := drain(t, c, 1)
+	return b
+}
+
+func keyRows(b core.Batch, col int) []string {
+	var out []string
+	for i, r := range b.Rows {
+		out = append(out, strconv.Itoa(int(b.KeyIdx[i]))+"="+string(r[col].B))
+	}
+	return out
+}
+
+// TestLookupRepeatedKeyInBatch: a key asked twice in one key batch is asked
+// of the Source once, and its rows come back once per occurrence.
+func TestLookupRepeatedKeyInBatch(t *testing.T) {
+	e := newEnv(t)
+	s := e.session(1)
+	stmt(t, s, core.PerTransaction)
+	k := func(i int) core.Key { return core.Key{Image: img(i), Raw: []byte(strconv.Itoa(i))} }
+	b := lookupAll(t, s, e.users, 0, []core.Key{k(1), k(2), k(1)}, core.ColumnSet{1}, nil, 10)
+	equal(t, keyRows(b, 0), "0=ann", "1=bob", "2=ann")
+	if len(e.src.asked) != 1 || len(e.src.asked[0]) != 2 {
+		t.Fatalf("Source asked %v, want one request for keys 1 and 2", e.src.asked)
+	}
+	// No cache across lookups (SD-4): the next lookup asks again.
+	lookupAll(t, s, e.users, 0, []core.Key{k(1)}, core.ColumnSet{1}, nil, 10)
+	if len(e.src.asked) != 2 {
+		t.Fatalf("Source asked %v, want a second request", e.src.asked)
+	}
+}
+
+// TestLookupManyRowsPerKey: a key with more rows than one page spans several
+// Next calls, and the Source is read one key batch per request.
+func TestLookupManyRowsPerKey(t *testing.T) {
+	e := newEnv(t)
+	rows := map[int]core.Row{}
+	for i := 0; i < 50; i++ {
+		rows[100+i] = row(100+i, strconv.Itoa(1+i%2)) // 25 orders of user 1, 25 of user 2
+	}
+	e.src.tables[e.orders].rows = rows
+	s := e.session(1)
+	stmt(t, s, core.PerTransaction)
+	k := func(i int) core.Key { return core.Key{Image: img(i), Raw: []byte(strconv.Itoa(i))} }
+	c, err := s.Lookup(e.orders, 1, []core.Key{k(1), k(2), k(1)}, core.ColumnSet{0, 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, calls := drain(t, c, 4)
+	if len(b.Rows) != 75 {
+		t.Fatalf("%d rows, want 75 (25 for each of three keys)", len(b.Rows))
+	}
+	if calls < 75/4 {
+		t.Fatalf("%d Next calls for 75 rows of at most 4", calls)
+	}
+	per := map[uint32]int{}
+	for i, r := range b.Rows {
+		per[b.KeyIdx[i]]++
+		want := "1"
+		if b.KeyIdx[i] == 1 {
+			want = "2"
+		}
+		if string(r[1].B) != want {
+			t.Fatalf("row %v answers key %d", r, b.KeyIdx[i])
+		}
+	}
+	if per[0] != 25 || per[1] != 25 || per[2] != 25 {
+		t.Fatalf("rows per key %v", per)
+	}
+	if len(e.src.asked) != 1 || len(e.src.asked[0]) != 2 {
+		t.Fatalf("Source asked %v, want one request for user ids 1 and 2", e.src.asked)
+	}
+}
+
+// TestLookupDeltaFirstAndMissing: Delta answers come first; the Missing hook
+// sees each unique key found nowhere, including keys the Delta deleted.
+func TestLookupDeltaFirstAndMissing(t *testing.T) {
+	e := newEnv(t)
+	s := e.session(1)
+	stmt(t, s, core.PerTransaction)
+	if res, err := s.Insert(e.users, []core.Row{row(4, "dan")}, [][]core.KeyImage{images(4)}); err != nil || res[0].Err != nil {
+		t.Fatalf("insert: %v %v", err, res)
+	}
+	if err := s.Delete(e.users, srcRef(3)); err != nil {
+		t.Fatal(err)
+	}
+	var missing []int
+	lk := &core.ReadLocks{Missing: func(_ core.TableID, _ core.IndexID, im core.KeyImage) error {
+		missing = append(missing, int(binary.BigEndian.Uint64(im)))
+		return nil
+	}}
+	k := func(i int) core.Key { return core.Key{Image: img(i), Raw: []byte(strconv.Itoa(i))} }
+	b := lookupAll(t, s, e.users, 0, []core.Key{k(1), k(4), k(3), k(9)}, core.ColumnSet{1}, lk, 1)
+	equal(t, keyRows(b, 0), "1=dan", "0=ann")
+	sort.Ints(missing)
+	if len(missing) != 2 || missing[0] != 3 || missing[1] != 9 {
+		t.Fatalf("missing %v, want [3 9]", missing)
+	}
+}
+
+// TestByColumnsStopsEarly: a caller that needs one child (RESTRICT) reads one
+// batch and closes the cursor.
+func TestByColumnsStopsEarly(t *testing.T) {
+	e := newEnv(t)
+	s := e.session(1)
+	stmt(t, s, core.PerTransaction)
+	c, err := s.ByColumns(e.orders, 1, img(1), core.ColumnSet{1}, core.Row{{B: []byte("1")}}, core.ColumnSet{0, 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := c.Next(1, 0)
+	if err != nil || len(b.Rows) != 1 {
+		t.Fatalf("first child: %v %v", b.Rows, err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
