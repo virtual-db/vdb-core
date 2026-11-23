@@ -19,12 +19,17 @@ the reference: one `Driver` built from its `Config` and the core's `DriverAPI`.
    the engine's own definitions as opaque bytes, and objects.
 2. Open one `Session` per database connection with `DriverAPI().OpenSession`.
 3. Per statement: `StmtBegin` (with the snapshot timing and read view the engine's isolation rules ask for), then
-   reads (`Scan`, `Lookup`, `ByColumns`, `Count`) and writes (`Insert`, `Update`, `Delete`, `Truncate`, and `DeleteAll` for a
+   reads (`Scan`, `Lookup`, `ByColumns`, `Count`; `Lookup` and `ByColumns` return cursors, read one key batch
+   of the Source per `Next`) and writes (`Insert`, `Update`, `Delete`, `Truncate`, and `DeleteAll` for a
    DELETE without WHERE), then `StmtEnd`
    or `StmtRollback`; per transaction `Commit` or `Rollback`; `Savepoint`, `RollbackTo`, `Release`; `Snapshot` for a
    consistent snapshot now.
 4. Take the locks its rules require with `Locks().Acquire(session, resource, mode, wait)`, passing a `ReadLocks` to a
    read to lock rows as they are returned; release a statement's locks with `ReleaseSince(session.LockMark())`.
+   `Covered(session, resource, mode)` says whether a range or whole-index lock the session holds already contains a
+   resource, so the engine can skip the point lock; `Release(session, resource, mark)` frees one lock taken after
+   `mark` (READ COMMITTED's release of rows that did not match). Every lock-table call costs O(log n) in the entries
+   held, so a statement may lock as many rows as it reads.
 5. Send every key with its sort image, every row with every index's image, and every update or delete with the
    `RowRef` the read returned and the whole old row.
 6. Stage DDL with `ApplyDDL` (client) or `ApplySourceDDL` (from the Source); convert Delta rows on a layout change

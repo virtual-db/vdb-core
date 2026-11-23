@@ -49,6 +49,13 @@ type Locks interface {
 	ReleaseSince(s Session, mark LockMark)
 	// ReleaseIf drops the session's locks for which drop returns true.
 	ReleaseIf(s Session, drop func(r Resource, mode LockMode) bool)
+	// Covered reports whether the session already holds a range or
+	// whole-index lock containing r in a mode that covers mode (Covers), so a
+	// lock on r would add nothing.
+	Covered(s Session, r Resource, mode LockMode) bool
+	// Release drops the locks the session took on exactly r after mark; a
+	// lock on r held at or before mark stays (READ COMMITTED unlock_row).
+	Release(s Session, r Resource, mark LockMark)
 }
 
 // Session is one client connection's view of the core. Used by one goroutine
@@ -67,10 +74,12 @@ type Session interface {
 	LockMark() LockMark
 
 	Scan(req ScanRequest) (ScanHandle, error)
-	Lookup(t TableID, idx IndexID, keys []Key, cols ColumnSet, locks *ReadLocks) (Batch, []KeyImage, error)
+	// Lookup answers keys on index idx as a cursor (see LookupCursor).
+	Lookup(t TableID, idx IndexID, keys []Key, cols ColumnSet, locks *ReadLocks) (LookupCursor, error)
 	// ByColumns reads every merged row whose columns cols equal values: the
 	// Delta through index idx at image img (a key prefix), the Source by value.
-	ByColumns(t TableID, idx IndexID, img KeyImage, cols ColumnSet, values Row, want ColumnSet, locks *ReadLocks) (Batch, error)
+	// The rows come as a cursor, so the caller can stop early (RESTRICT).
+	ByColumns(t TableID, idx IndexID, img KeyImage, cols ColumnSet, values Row, want ColumnSet, locks *ReadLocks) (Cursor, error)
 	Count(t TableID) (count uint64, declined bool, err error)
 
 	Insert(t TableID, rows []Row, images [][]KeyImage) ([]WriteResult, error)

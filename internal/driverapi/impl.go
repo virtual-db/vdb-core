@@ -83,6 +83,19 @@ func (l locks) ReleaseIf(s types.Session, drop func(types.Resource, types.LockMo
 	}
 }
 
+func (l locks) Covered(s types.Session, r types.Resource, mode types.LockMode) bool {
+	if ss, ok := s.(*session.Session); ok && ss.TxID() != 0 {
+		return l.m.Covered(ss.TxID(), r, mode)
+	}
+	return false
+}
+
+func (l locks) Release(s types.Session, r types.Resource, mark types.LockMark) {
+	if ss, ok := s.(*session.Session); ok && ss.TxID() != 0 {
+		l.m.Release(ss.TxID(), r, mark)
+	}
+}
+
 // ConnectionOpened runs vdb.connection.opened.
 func (a *Impl) ConnectionOpened(connID uint64, account, addr string) error {
 	_, err := a.p.Process(points.PipelineConnectionOpened, payloads.ConnectionOpenedPayload{ConnectionID: connID, User: account, Address: addr})

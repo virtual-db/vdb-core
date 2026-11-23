@@ -42,10 +42,6 @@ type Tx struct {
 	own        map[types.TableID]map[string]bool // identity images this tx wrote
 	ownTouch   map[types.TableID]map[string]bool // Source keys this tx touched
 
-	// LookupCache answers keys already asked inside one Source snapshot (D-68).
-	// It holds Source rows only and is dropped with the snapshot.
-	LookupCache map[string]CachedLookup
-
 	Killed <-chan struct{}
 	done   bool
 }
@@ -214,15 +210,8 @@ func (tx *Tx) TakePair(needSource bool) error {
 	return nil
 }
 
-// CachedLookup is the Source's answer for one key.
-type CachedLookup struct {
-	Rows []types.Row
-	Keys []types.SourceKey
-}
-
 func (tx *Tx) dropPair() {
 	tx.root = nil
-	tx.LookupCache = nil
 	if tx.srcOpen {
 		_ = tx.src.Close()
 		tx.src, tx.srcOpen = nil, false
