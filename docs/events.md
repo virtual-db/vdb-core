@@ -39,7 +39,7 @@ or not, as JSON with the same field names. Identifiers are integers. A row is an
 | `vdb.record.inserted` | After rows land in the Delta through `vdb.write.insert` | `WriteInsertPayload`: `ConnectionID`, `Table`, `TableID`, `Columns`, `Rows`, `Images`, `Results` (one per row) |
 | `vdb.record.updated` | After an update lands through `vdb.write.update` | `WriteUpdatePayload`: `ConnectionID`, `Table`, `TableID`, `Columns`, `Old` (`core.RowRef`), `New`, `Images` |
 | `vdb.record.deleted` | After a delete lands through `vdb.write.delete` | `WriteDeletePayload`: `ConnectionID`, `Table`, `TableID`, `Old` (`core.RowRef`) |
-| `vdb.table.truncated` | After a truncate through `vdb.write.truncate` (the table is detached from the Source) | `WriteTruncatePayload`: `ConnectionID`, `Table`, `TableID` |
+| `vdb.table.truncated` | After a truncate, or a DELETE without WHERE (`Delete` set), through `vdb.write.truncate` (the table is detached from the Source) | `WriteTruncatePayload`: `ConnectionID`, `Table`, `TableID`, `Delete`, `Rows` |
 | `vdb.schema.loaded` | When a table is added to the catalog of record | `SchemaPayload`: `Database`, `Table`, `TableID`, `Kind`, `Version`, `Columns` |
 | `vdb.schema.invalidated` | When a table is changed by the Source or by client DDL | `SchemaPayload`, as above |
 | `vdb.limit.reached` | When the memory or lock limit refuses work | `LimitReachedPayload`: `Limit`, `Value`, `ConnectionID` |

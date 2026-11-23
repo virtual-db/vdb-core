@@ -103,7 +103,8 @@ func (h *Handlers) DeleteApply(ctx any, p any) (any, any, error) {
 	return ctx, pl, nil
 }
 
-// TruncateApply detaches the payload's table.
+// TruncateApply detaches the payload's table: TRUNCATE, or a DELETE without
+// WHERE when the payload says Delete.
 func (h *Handlers) TruncateApply(ctx any, p any) (any, any, error) {
 	pl, err := payloads.Decode[payloads.WriteTruncatePayload](p)
 	if err != nil {
@@ -113,7 +114,12 @@ func (h *Handlers) TruncateApply(ctx any, p any) (any, any, error) {
 	if err != nil {
 		return ctx, nil, err
 	}
-	if err := h.W.Truncate(tx, pl.TableID); err != nil {
+	if pl.Delete {
+		err = h.W.DeleteAll(tx, pl.TableID)
+	} else {
+		err = h.W.Truncate(tx, pl.TableID)
+	}
+	if err != nil {
 		return ctx, nil, err
 	}
 	return ctx, pl, nil
