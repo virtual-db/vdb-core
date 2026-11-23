@@ -10,90 +10,150 @@ package merge
 import (
 	"io"
 
+	"github.com/virtual-db/vdb-core/internal/delta"
 	"github.com/virtual-db/vdb-core/internal/txn"
 	"github.com/virtual-db/vdb-core/internal/types"
 )
 
-// ByColumns returns the merged rows of table t whose columns cols equal values,
-// with the columns want (nil: every column). The Delta is read through index
-// idx at image img, compared as a prefix; a nil img skips the Delta side.
-// With locks, each row is locked through the engine's hook and replaced by its
-// latest committed version, and rows deleted since the snapshot are dropped.
+// ByColumns returns a cursor over the merged rows of table t whose columns
+// cols equal values, with the columns want (nil: every column). The Delta is
+// read through index idx at image img, compared as a prefix; a nil img skips
+// the Delta side. Then the Source is read through its cursor, one batch per
+// Next (Source scaling plan K3), so a parent with many children is never held
+// whole; a RESTRICT check can stop after the first row. With locks, each row
+// is locked through the engine's hook and replaced by its latest committed
+// version, and rows deleted since the snapshot are dropped.
 func (m *Merge) ByColumns(tx *txn.Tx, t types.TableID, idx types.IndexID, img types.KeyImage, cols types.ColumnSet,
-	values types.Row, want types.ColumnSet, lk *types.ReadLocks) (types.Batch, error) {
+	values types.Row, want types.ColumnSet, lk *types.ReadLocks) (types.Cursor, error) {
 	d, err := def(tx, t)
 	if err != nil {
-		return types.Batch{}, err
+		return nil, err
 	}
 	if d.Kind == types.Provided {
-		return types.Batch{}, &types.Error{Code: types.ErrRefused, Table: t, Msg: "provided tables are read by scans only"}
+		return nil, &types.Error{Code: types.ErrRefused, Table: t, Msg: "provided tables are read by scans only"}
 	}
 	view, err := tx.View(t)
 	if err != nil {
-		return types.Batch{}, err
+		return nil, err
 	}
-	whole := d.Identity == types.WholeRow
-	var out types.Batch
-	seen := map[string]bool{}
+	c := &byColumnsCursor{m: m, tx: tx, d: d, view: view, cols: cols, values: values, want: want, lk: lk,
+		whole: d.Identity == types.WholeRow, seen: map[string]bool{}}
 	if view != nil && img != nil {
 		r := types.ImageRange{Low: img, High: img, LowIncl: true, HighIncl: true}
-		it := view.IndexInRange(idx, r, types.Forward)
-		if idx == d.Identity && !whole {
-			it = view.RowsInRange(r, types.Forward)
+		if idx == d.Identity && !c.whole {
+			c.it = view.RowsInRange(r, types.Forward)
+		} else {
+			c.it = view.IndexInRange(idx, r, types.Forward)
 		}
-		for dr := it.Next(); dr != nil; dr = it.Next() {
-			row := dr
-			if lk != nil && lk.Row != nil {
-				if err := lk.Row(t, types.LockKey(dr.SourceKey, dr.Image)); err != nil {
-					it.Close()
-					return out, err
-				}
-				latest, _ := tx.Latest(t, dr.Image, nil)
-				if latest == nil {
-					continue
-				}
-				row = latest
-			}
-			out.Rows = append(out.Rows, types.Project(row.Row, want))
-			out.Refs = append(out.Refs, deltaRef(row, whole))
-			if row.SourceKey != nil {
-				seen[string(row.SourceKey)] = true
-			}
-		}
-		it.Close()
 	}
-	if !hasSource(d, view) {
+	c.source = hasSource(d, view)
+	return c, nil
+}
+
+type byColumnsCursor struct {
+	m      *Merge
+	tx     *txn.Tx
+	d      *types.TableDef
+	view   *delta.Table
+	cols   types.ColumnSet
+	values types.Row
+	want   types.ColumnSet
+	lk     *types.ReadLocks
+	whole  bool
+	seen   map[string]bool // Source keys the Delta already answered
+	it     *delta.Iter
+	source bool
+	sc     types.SourceCursor
+	done   bool
+}
+
+func (c *byColumnsCursor) Close() error {
+	if c.it != nil {
+		c.it.Close()
+		c.it = nil
+	}
+	if c.sc != nil {
+		_ = c.sc.Close()
+		c.sc = nil
+	}
+	c.done = true
+	return nil
+}
+
+func (c *byColumnsCursor) Next(maxRows, maxBytes int) (types.Batch, error) {
+	if maxRows <= 0 {
+		maxRows = c.m.cfg.KeyBatch
+	}
+	var out types.Batch
+	for c.it != nil && len(out.Rows) < maxRows {
+		dr := c.it.Next()
+		if dr == nil {
+			c.it.Close()
+			c.it = nil
+			break
+		}
+		row := dr
+		if c.lk != nil && c.lk.Row != nil {
+			if err := c.lk.Row(c.d.ID, types.LockKey(dr.SourceKey, dr.Image)); err != nil {
+				c.Close()
+				return types.Batch{}, err
+			}
+			latest, _ := c.tx.Latest(c.d.ID, dr.Image, nil)
+			if latest == nil {
+				continue
+			}
+			row = latest
+		}
+		out.Rows = append(out.Rows, types.Project(row.Row, c.want))
+		out.Refs = append(out.Refs, deltaRef(row, c.whole))
+		if row.SourceKey != nil {
+			c.seen[string(row.SourceKey)] = true
+		}
+	}
+	if len(out.Rows) > 0 {
 		return out, nil
 	}
-	snap, err := tx.Source()
-	if err != nil {
-		return out, err
-	}
-	cur, err := snap.ByColumns(t, cols, []types.Row{values}, want)
-	if err != nil {
-		return out, &types.Error{Code: types.ErrSource, Table: t, Msg: err.Error()}
-	}
-	defer cur.Close()
-	for {
-		sr, err := cur.Next(m.cfg.KeyBatch)
-		if len(sr.Rows) > 0 {
-			b, _, ferr := m.filterSourceIdx(tx, d, view, sr, want, lk, whole, nil)
-			if ferr != nil {
-				return out, ferr
+	for !c.done && c.source {
+		if c.sc == nil {
+			snap, err := c.tx.Source()
+			if err != nil {
+				c.Close()
+				return types.Batch{}, err
 			}
-			for i := range b.Rows {
-				if k := b.Refs[i].SourceKey; k != nil && seen[string(k)] {
-					continue
-				}
-				out.Rows = append(out.Rows, b.Rows[i])
-				out.Refs = append(out.Refs, b.Refs[i])
+			sc, err := snap.ByColumns(c.d.ID, c.cols, []types.Row{c.values}, c.want)
+			if err != nil {
+				c.Close()
+				return types.Batch{}, &types.Error{Code: types.ErrSource, Table: c.d.ID, Msg: err.Error()}
 			}
+			c.sc = sc
+		}
+		sr, err := c.sc.Next(maxRows)
+		if err != nil && err != io.EOF {
+			c.Close()
+			return types.Batch{}, &types.Error{Code: types.ErrSource, Table: c.d.ID, Msg: err.Error()}
 		}
 		if err == io.EOF || len(sr.Rows) == 0 {
+			c.done = true
+		}
+		if len(sr.Rows) == 0 {
+			break
+		}
+		b, _, ferr := c.m.filterSourceIdx(c.tx, c.d, c.view, sr, c.want, c.lk, c.whole, nil)
+		if ferr != nil {
+			c.Close()
+			return types.Batch{}, ferr
+		}
+		for i := range b.Rows {
+			if k := b.Refs[i].SourceKey; k != nil && c.seen[string(k)] {
+				continue
+			}
+			out.Rows = append(out.Rows, b.Rows[i])
+			out.Refs = append(out.Refs, b.Refs[i])
+		}
+		if len(out.Rows) > 0 {
 			return out, nil
 		}
-		if err != nil {
-			return out, &types.Error{Code: types.ErrSource, Table: t, Msg: err.Error()}
-		}
 	}
+	c.Close()
+	return types.Batch{}, io.EOF
 }
