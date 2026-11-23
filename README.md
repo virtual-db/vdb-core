@@ -89,7 +89,7 @@ type DriverAPI interface {
     OpenSession(info SessionInfo) (Session, error)
     Kill(connID uint64)
     Catalog() Catalog
-    Locks() Locks // the lock table: Define(modes), Acquire, ReleaseSince
+    Locks() Locks // the lock table: Define(modes), Acquire, ReleaseSince, ReleaseIf, Covered, Release
     ConnectionOpened(connID uint64, account, addr string) error
     ConnectionClosed(connID uint64, account, addr string)
     QueryReceived(connID uint64, query, database string) (string, error)
