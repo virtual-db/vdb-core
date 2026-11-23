@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tidwall/btree"
 	"github.com/virtual-db/vdb-core/internal/delta"
 	"github.com/virtual-db/vdb-core/internal/types"
 )
@@ -47,6 +48,14 @@ type slot struct {
 	index types.IndexID
 }
 
+// txLocks indexes one transaction's entries: by grant order (Mark,
+// ReleaseSince), by exact resource (holds, Release) and by interval (Covered).
+type txLocks struct {
+	bySeq  btree.Map[uint64, *entry]
+	byRes  map[slot]map[string][]*entry
+	ranges map[slot]*itree
+}
+
 // Reserver is the memory guard's interface.
 type Reserver interface {
 	Reserve(n int, kind string) error
@@ -56,9 +65,9 @@ type Reserver interface {
 type Manager struct {
 	mu      sync.Mutex
 	modes   types.LockModes
-	points  map[slot]map[string][]*entry
-	ranges  map[slot][]*entry // ranges and whole-index entries
-	byTx    map[uint64][]*entry
+	points  map[slot]*btree.Map[string, []*entry]
+	ranges  map[slot]*itree // ranges and whole-index entries
+	byTx    map[uint64]*txLocks
 	waitFor map[uint64]map[uint64]bool
 	victims map[uint64]chan struct{}
 	changed chan struct{}
@@ -72,9 +81,9 @@ type Manager struct {
 // overlapping resources conflict.
 func New(mem Reserver) *Manager {
 	return &Manager{
-		points:  map[slot]map[string][]*entry{},
-		ranges:  map[slot][]*entry{},
-		byTx:    map[uint64][]*entry{},
+		points:  map[slot]*btree.Map[string, []*entry]{},
+		ranges:  map[slot]*itree{},
+		byTx:    map[uint64]*txLocks{},
 		waitFor: map[uint64]map[uint64]bool{},
 		victims: map[uint64]chan struct{}{},
 		changed: make(chan struct{}),
@@ -143,7 +152,8 @@ func sameResource(a, b types.Resource) bool {
 	return bytes.Equal(x.Low, y.Low) && bytes.Equal(x.High, y.High) && x.LowIncl == y.LowIncl && x.HighIncl == y.HighIncl
 }
 
-// conflicts returns the entries of other transactions that block r in mode.
+// conflicts returns the entries of other transactions that block r in mode,
+// point entries first and each group in grant order.
 func (m *Manager) conflicts(tx uint64, r types.Resource, mode types.LockMode) []*entry {
 	var out []*entry
 	s := slot{r.Table, r.Index}
@@ -152,30 +162,101 @@ func (m *Manager) conflicts(tx uint64, r types.Resource, mode types.LockMode) []
 			out = append(out, e)
 		}
 	}
-	if isPoint(r) {
-		for _, e := range m.points[s][string(r.Point)] {
-			check(e)
-		}
-	} else {
-		for _, es := range m.points[s] {
+	lo, hi := span(r)
+	if pts := m.points[s]; pts != nil {
+		if isPoint(r) {
+			es, _ := pts.Get(string(r.Point))
 			for _, e := range es {
+				check(e)
+			}
+		} else {
+			var pe []*entry
+			pts.Ascend(lo, func(k string, es []*entry) bool {
+				if !hi.inf && k >= hi.b {
+					return false
+				}
+				for _, e := range es {
+					if e.tx != tx {
+						pe = append(pe, e)
+					}
+				}
+				return true
+			})
+			sort.Slice(pe, func(i, j int) bool { return pe[i].seq < pe[j].seq })
+			for _, e := range pe {
 				check(e)
 			}
 		}
 	}
-	for _, e := range m.ranges[s] {
-		check(e)
+	if rs := m.ranges[s]; rs != nil {
+		var re []*entry
+		rs.overlapping(lo, hi, func(e *entry) bool {
+			if e.tx != tx {
+				re = append(re, e)
+			}
+			return true
+		})
+		sort.Slice(re, func(i, j int) bool { return re[i].seq < re[j].seq })
+		for _, e := range re {
+			check(e)
+		}
 	}
 	return out
 }
 
 func (m *Manager) holds(tx uint64, r types.Resource, mode types.LockMode) bool {
-	for _, e := range m.byTx[tx] {
-		if sameResource(e.res, r) && m.covers(e.mode, mode) {
+	t := m.byTx[tx]
+	if t == nil {
+		return false
+	}
+	for _, e := range t.byRes[slot{r.Table, r.Index}][bytesKey(r)] {
+		if m.covers(e.mode, mode) {
 			return true
 		}
 	}
 	return false
+}
+
+// Covered reports whether tx holds a range or whole-index lock that contains
+// the point resource r in a mode that covers mode (Covers), so that a lock on
+// r itself would add nothing. It does not look at point locks.
+func (m *Manager) Covered(tx uint64, r types.Resource, mode types.LockMode) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.byTx[tx]
+	if t == nil {
+		return false
+	}
+	rs := t.ranges[slot{r.Table, r.Index}]
+	if rs == nil {
+		return false
+	}
+	found := false
+	lo, hi := span(r)
+	rs.overlapping(lo, hi, func(e *entry) bool {
+		if contains(e.res, r) && m.covers(e.mode, mode) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// contains reports whether held, a range or whole index, contains all of r.
+func contains(held, r types.Resource) bool {
+	switch {
+	case held.Whole:
+		return true
+	case isPoint(held) || r.Whole:
+		return false
+	case isPoint(r):
+		return delta.InRange(r.Point, *held.Range)
+	}
+	h, x := *held.Range, *r.Range
+	lowOK := len(h.Low) == 0 || (len(x.Low) != 0 && delta.InLow(x.Low, h) && (h.LowIncl || !x.LowIncl || !bytes.Equal(x.Low, h.Low)))
+	highOK := len(h.High) == 0 || (len(x.High) != 0 && delta.InHigh(x.High, h) && (h.HighIncl || !x.HighIncl || !bytes.Equal(x.High, h.High)))
+	return lowOK && highOK
 }
 
 // Acquire takes a lock for w, waiting while another transaction holds a
@@ -284,17 +365,42 @@ func (m *Manager) grant(w Waiter, r types.Resource, mode types.LockMode) {
 	m.seq++
 	e := &entry{res: r, mode: mode, tx: w.Tx, conn: w.Conn, seq: m.seq}
 	s := slot{r.Table, r.Index}
-	if isPoint(r) {
-		mm := m.points[s]
-		if mm == nil {
-			mm = map[string][]*entry{}
-			m.points[s] = mm
-		}
-		mm[string(r.Point)] = append(mm[string(r.Point)], e)
-	} else {
-		m.ranges[s] = append(m.ranges[s], e)
+	t := m.byTx[w.Tx]
+	if t == nil {
+		t = &txLocks{byRes: map[slot]map[string][]*entry{}, ranges: map[slot]*itree{}}
+		m.byTx[w.Tx] = t
 	}
-	m.byTx[w.Tx] = append(m.byTx[w.Tx], e)
+	if isPoint(r) {
+		pts := m.points[s]
+		if pts == nil {
+			pts = &btree.Map[string, []*entry]{}
+			m.points[s] = pts
+		}
+		k := string(r.Point)
+		es, _ := pts.Get(k)
+		pts.Set(k, append(es, e))
+	} else {
+		rs := m.ranges[s]
+		if rs == nil {
+			rs = &itree{}
+			m.ranges[s] = rs
+		}
+		rs.insert(e)
+		trs := t.ranges[s]
+		if trs == nil {
+			trs = &itree{}
+			t.ranges[s] = trs
+		}
+		trs.insert(e)
+	}
+	t.bySeq.Set(e.seq, e)
+	br := t.byRes[s]
+	if br == nil {
+		br = map[string][]*entry{}
+		t.byRes[s] = br
+	}
+	k := bytesKey(r)
+	br[k] = append(br[k], e)
 	m.entries++
 }
 
@@ -332,83 +438,143 @@ func (m *Manager) cycleFrom(start uint64) []uint64 {
 func (m *Manager) Mark(tx uint64) types.LockMark {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	es := m.byTx[tx]
-	if len(es) == 0 {
-		return types.LockMark(m.seq)
+	if t := m.byTx[tx]; t != nil {
+		if seq, _, ok := t.bySeq.Max(); ok {
+			return types.LockMark(seq)
+		}
 	}
-	return types.LockMark(es[len(es)-1].seq)
+	return types.LockMark(m.seq)
 }
 
 // ReleaseAll drops every lock tx holds and wakes waiters.
 func (m *Manager) ReleaseAll(tx uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseLocked(tx, func(*entry) bool { return true })
+	t := m.byTx[tx]
+	if t == nil {
+		m.forget(tx)
+		return
+	}
+	var drop []*entry
+	t.bySeq.Scan(func(_ uint64, e *entry) bool { drop = append(drop, e); return true })
+	m.releaseLocked(tx, drop)
 }
 
 // ReleaseSince drops the locks tx took after mark.
 func (m *Manager) ReleaseSince(tx uint64, mark types.LockMark) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseLocked(tx, func(e *entry) bool { return e.seq > uint64(mark) })
+	t := m.byTx[tx]
+	if t == nil {
+		m.forget(tx) // as before: a transaction holding nothing has no edges
+		return
+	}
+	var drop []*entry
+	t.bySeq.Ascend(uint64(mark)+1, func(_ uint64, e *entry) bool { drop = append(drop, e); return true })
+	m.releaseLocked(tx, drop)
+}
+
+// Release drops the locks tx took on exactly resource r after mark. A lock on
+// r that tx held at or before mark stays. The engine uses it at READ
+// COMMITTED to free the lock of a row the statement read and did not keep.
+func (m *Manager) Release(tx uint64, r types.Resource, mark types.LockMark) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.byTx[tx]
+	if t == nil {
+		m.forget(tx) // as before: a transaction holding nothing has no edges
+		return
+	}
+	var drop []*entry
+	for _, e := range t.byRes[slot{r.Table, r.Index}][bytesKey(r)] {
+		if e.seq > uint64(mark) {
+			drop = append(drop, e)
+		}
+	}
+	m.releaseLocked(tx, drop)
 }
 
 // ReleaseIf drops the locks of tx for which drop returns true.
 func (m *Manager) ReleaseIf(tx uint64, drop func(r types.Resource, mode types.LockMode) bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseLocked(tx, func(e *entry) bool { return drop(e.res, e.mode) })
+	t := m.byTx[tx]
+	if t == nil {
+		m.forget(tx) // as before: a transaction holding nothing has no edges
+		return
+	}
+	var out []*entry
+	t.bySeq.Scan(func(_ uint64, e *entry) bool {
+		if drop(e.res, e.mode) {
+			out = append(out, e)
+		}
+		return true
+	})
+	m.releaseLocked(tx, out)
 }
 
-func (m *Manager) releaseLocked(tx uint64, drop func(*entry) bool) {
-	var keep []*entry
-	n := 0
-	for _, e := range m.byTx[tx] {
-		if !drop(e) {
-			keep = append(keep, e)
-			continue
+func removeEntry(es []*entry, e *entry) []*entry {
+	for i, x := range es {
+		if x == e {
+			return append(es[:i], es[i+1:]...)
 		}
-		n++
+	}
+	return es
+}
+
+// releaseLocked removes the given entries of tx from every index.
+func (m *Manager) releaseLocked(tx uint64, drop []*entry) {
+	t := m.byTx[tx]
+	for _, e := range drop {
 		s := slot{e.res.Table, e.res.Index}
 		if isPoint(e.res) {
+			pts := m.points[s]
 			k := string(e.res.Point)
-			es := m.points[s][k]
-			for i, x := range es {
-				if x == e {
-					es = append(es[:i], es[i+1:]...)
-					break
+			es, _ := pts.Get(k)
+			if es = removeEntry(es, e); len(es) == 0 {
+				pts.Delete(k)
+				if pts.Len() == 0 {
+					delete(m.points, s)
 				}
-			}
-			if len(es) == 0 {
-				delete(m.points[s], k)
 			} else {
-				m.points[s][k] = es
+				pts.Set(k, es)
 			}
 		} else {
-			es := m.ranges[s]
-			for i, x := range es {
-				if x == e {
-					es = append(es[:i], es[i+1:]...)
-					break
-				}
+			m.ranges[s].remove(e)
+			if m.ranges[s].n == 0 {
+				delete(m.ranges, s)
 			}
-			m.ranges[s] = es
+			t.ranges[s].remove(e)
+			if t.ranges[s].n == 0 {
+				delete(t.ranges, s)
+			}
+		}
+		t.bySeq.Delete(e.seq)
+		k := bytesKey(e.res)
+		if es := removeEntry(t.byRes[s][k], e); len(es) == 0 {
+			delete(t.byRes[s], k)
+			if len(t.byRes[s]) == 0 {
+				delete(t.byRes, s)
+			}
+		} else {
+			t.byRes[s][k] = es
 		}
 	}
-	if len(keep) == 0 {
+	m.entries -= uint64(len(drop))
+	if t.bySeq.Len() == 0 {
 		delete(m.byTx, tx)
-	} else {
-		m.byTx[tx] = keep
+		m.forget(tx)
 	}
-	m.entries -= uint64(n)
-	if len(keep) == 0 {
-		delete(m.waitFor, tx)
-		delete(m.victims, tx)
-	}
-	if n > 0 {
+	if len(drop) > 0 {
 		close(m.changed)
 		m.changed = make(chan struct{})
 	}
+}
+
+// forget drops tx's wait-for edges and victim channel once it holds nothing.
+func (m *Manager) forget(tx uint64) {
+	delete(m.waitFor, tx)
+	delete(m.victims, tx)
 }
 
 // Stats reports the lock table's counters.
@@ -422,5 +588,8 @@ func (m *Manager) Stats() types.LockStats {
 func (m *Manager) Held(tx uint64) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.byTx[tx])
+	if t := m.byTx[tx]; t != nil {
+		return t.bySeq.Len()
+	}
+	return 0
 }
