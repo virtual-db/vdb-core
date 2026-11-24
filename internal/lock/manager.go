@@ -536,6 +536,27 @@ func (m *Manager) ReleaseIf(tx uint64, drop func(r types.Resource, mode types.Lo
 	m.releaseLocked(tx, out)
 }
 
+// ReleaseModeSince drops the locks of tx with the given mode that were
+// acquired after mark. This allows the engine to release interval locks
+// at READ COMMITTED statement end while keeping record locks on modified rows.
+func (m *Manager) ReleaseModeSince(tx uint64, mode types.LockMode, mark types.LockMark) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.byTx[tx]
+	if t == nil {
+		m.forget(tx)
+		return
+	}
+	var drop []*entry
+	t.bySeq.Ascend(uint64(mark)+1, func(_ uint64, e *entry) bool {
+		if e.mode == mode {
+			drop = append(drop, e)
+		}
+		return true
+	})
+	m.releaseLocked(tx, drop)
+}
+
 func removeEntry(es []*entry, e *entry) []*entry {
 	for i, x := range es {
 		if x == e {

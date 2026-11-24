@@ -104,6 +104,12 @@ func (l locks) Release(s types.Session, r types.Resource, mark types.LockMark) {
 	}
 }
 
+func (l locks) ReleaseModeSince(s types.Session, mode types.LockMode, mark types.LockMark) {
+	if ss, ok := s.(*session.Session); ok && ss.TxID() != 0 {
+		l.m.ReleaseModeSince(ss.TxID(), mode, mark)
+	}
+}
+
 // ConnectionOpened runs vdb.connection.opened.
 func (a *Impl) ConnectionOpened(connID uint64, account, addr string) error {
 	_, err := a.p.Process(points.PipelineConnectionOpened, payloads.ConnectionOpenedPayload{ConnectionID: connID, User: account, Address: addr})
