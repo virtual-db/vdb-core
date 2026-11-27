@@ -102,7 +102,7 @@ func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images []
 	if err != nil {
 		return nil, err
 	}
-	view, err := tx.View(t)
+	view, err := tx.Probe(t)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +212,7 @@ func cloneImages(ims []types.KeyImage, pk types.KeyImage, d *types.TableDef) []t
 // selfImg and selfKey exclude the row being updated.
 func (w *Writer) checkUnique(tx *txn.Tx, d *types.TableDef, row types.Row, ims []types.KeyImage, selfImg types.KeyImage, selfKey types.SourceKey, srcDupPK bool) error {
 	t := d.ID
-	view, err := tx.View(t)
+	view, err := tx.Probe(t)
 	if err != nil {
 		return err
 	}
@@ -342,7 +342,7 @@ func oldRowOf(tx *txn.Tx, t types.TableID, old types.RowRef) (*delta.DeltaRow, t
 		if r, _ := tx.Latest(t, old.PK.Image, nil); r != nil {
 			return r, r.Row
 		}
-		if v, err := tx.View(t); err == nil && v != nil {
+		if v, err := tx.Probe(t); err == nil && v != nil {
 			if r, ok := v.Get(old.PK.Image); ok {
 				return r, r.Row
 			}

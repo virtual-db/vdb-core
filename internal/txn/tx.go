@@ -253,6 +253,33 @@ func (tx *Tx) View(t types.TableID) (*delta.Table, error) {
 	return nil, nil
 }
 
+// Probe returns the same view of a table's Delta as View, for point lookups
+// (Get, Holds, IsTouched, IndexHas) only, without View's Copy().
+//
+// A Copy() marks every tree of the draft's table as shared, so the draft's
+// next write copies the whole root-to-leaf path in each tree. Taking one per
+// written row (the uniqueness check) made every write copy B-tree nodes.
+//
+// The returned table is the draft's own (or the published root's) and must
+// not be iterated or held across a write of this transaction: the caller
+// uses it and drops it before its next Apply, Restore or Commit. Only the
+// transaction's own goroutine writes its draft; other sessions read only the
+// draft's ops (Manager.uncommitted), so the lookups need no copy.
+func (tx *Tx) Probe(t types.TableID) (*delta.Table, error) {
+	if err := tx.TakePair(false); err != nil {
+		return nil, err
+	}
+	if tx.Ctx.View == types.ViewUncommitted {
+		return tx.m.uncommitted(tx, t)
+	}
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.draft != nil {
+		return tx.draft.Table(t), nil
+	}
+	return tx.root.Table(t), nil
+}
+
 // Latest returns the newest version of a Delta row for a locking read: the
 // transaction's own write, else the current committed state, not the snapshot
 // (product doc 05 §3.2). It also reports whether the Source key is touched.
