@@ -6,7 +6,6 @@
 package types
 
 import (
-	"bytes"
 	"encoding/binary"
 	"time"
 )
@@ -405,19 +404,23 @@ type MemoryStats struct {
 // EncodeSourceKey builds a SourceKey from column values: per column, a 4-byte
 // little-endian length (0xFFFFFFFF for NULL) followed by the bytes.
 func EncodeSourceKey(vals []Value) SourceKey {
-	var b bytes.Buffer
-	var n [4]byte
+	size := 0
+	for _, v := range vals {
+		size += 4 + len(v.B)
+	}
+	if size == 0 {
+		return nil
+	}
+	b := make([]byte, 0, size)
 	for _, v := range vals {
 		if v.Null {
-			binary.LittleEndian.PutUint32(n[:], 0xFFFFFFFF)
-			b.Write(n[:])
+			b = binary.LittleEndian.AppendUint32(b, 0xFFFFFFFF)
 			continue
 		}
-		binary.LittleEndian.PutUint32(n[:], uint32(len(v.B)))
-		b.Write(n[:])
-		b.Write(v.B)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(v.B)))
+		b = append(b, v.B...)
 	}
-	return b.Bytes()
+	return b
 }
 
 // DecodeSourceKey splits a SourceKey back into values.

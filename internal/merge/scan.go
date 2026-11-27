@@ -218,7 +218,8 @@ func (m *Merge) filterSourceIdx(tx *txn.Tx, d *types.TableDef, view *delta.Table
 			return types.Batch{}, nil, &types.Error{Code: types.ErrInternal, Table: d.ID, Msg: "a vdb.records.source handler changed the number of rows"}
 		}
 	}
-	var b types.Batch
+	b := types.Batch{Rows: make([]types.Row, 0, len(rows)), Refs: make([]types.RowRef, 0, len(rows))}
+	orig = make([]int, 0, len(rows))
 	for i, row := range rows {
 		var key types.SourceKey
 		if i < len(sr.Keys) {
