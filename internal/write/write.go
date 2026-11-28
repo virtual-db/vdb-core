@@ -102,16 +102,25 @@ func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images []
 	if err != nil {
 		return nil, err
 	}
-	view, err := tx.Probe(t)
-	if err != nil {
-		return nil, err
-	}
-	whole := d.Identity == types.WholeRow
 	results := make([]types.WriteResult, len(rows))
 
 	// Source check of the identity key, batched over every row of the call.
+	// The probed table is used only here, before insertOne writes the draft.
 	srcDup := make([]bool, len(rows))
-	if hasSource(d, view) && !whole {
+	if err := w.sourceDupIdentity(tx, d, t, rows, srcDup); err != nil {
+		return nil, err
+	}
+	return w.insertRows(tx, d, t, rows, images, results, srcDup)
+}
+
+// sourceDupIdentity sets srcDup[i] when row i's identity key is held by a
+// Source row that neither the view nor the latest committed state touched.
+func (w *Writer) sourceDupIdentity(tx *txn.Tx, d *types.TableDef, t types.TableID, rows []types.Row, srcDup []bool) error {
+	view, err := tx.Probe(t)
+	if err != nil {
+		return err
+	}
+	if hasSource(d, view) && d.Identity != types.WholeRow {
 		cols := d.IdentityColumns()
 		var keys []types.SourceKey
 		var at []int
@@ -125,11 +134,11 @@ func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images []
 		if len(keys) > 0 {
 			snap, err := tx.Source()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			ex, err := snap.Exists(t, keys)
 			if err != nil {
-				return nil, &types.Error{Code: types.ErrSource, Table: t, Msg: err.Error()}
+				return &types.Error{Code: types.ErrSource, Table: t, Msg: err.Error()}
 			}
 			for j, e := range ex {
 				if !e {
@@ -146,7 +155,10 @@ func (w *Writer) Insert(tx *txn.Tx, t types.TableID, rows []types.Row, images []
 			}
 		}
 	}
+	return nil
+}
 
+func (w *Writer) insertRows(tx *txn.Tx, d *types.TableDef, t types.TableID, rows []types.Row, images [][]types.KeyImage, results []types.WriteResult, srcDup []bool) ([]types.WriteResult, error) {
 	full := false
 	for i, row := range rows {
 		if full {

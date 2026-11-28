@@ -260,9 +260,10 @@ func (tx *Tx) View(t types.TableID) (*delta.Table, error) {
 // next write copies the whole root-to-leaf path in each tree. Taking one per
 // written row (the uniqueness check) made every write copy B-tree nodes.
 //
-// The returned table is the draft's own (or the published root's) and must
-// not be iterated or held across a write of this transaction: the caller
-// uses it and drops it before its next Apply, Restore or Commit. Only the
+// The returned table is the draft's own (or the published root's). Neither
+// it nor any iterator or cursor over it may be held across a write of this
+// transaction: the caller uses it and drops it before its next Apply,
+// Restore or Commit. Only the
 // transaction's own goroutine writes its draft; other sessions read only the
 // draft's ops (Manager.uncommitted), so the lookups need no copy.
 func (tx *Tx) Probe(t types.TableID) (*delta.Table, error) {

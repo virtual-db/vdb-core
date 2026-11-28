@@ -247,7 +247,17 @@ func TestCursorStableAcrossWrites(t *testing.T) {
 // Sessions with the uncommitted read view read a writer's draft while it
 // writes. Run with -race: the writer's unique checks must not race them.
 func TestUncommittedReadersDuringWrites(t *testing.T) {
-	e := newUniqEnv(t, core.Local, 0)
+	t.Run("local", func(t *testing.T) { uncommittedReadersDuringWrites(t, core.Local) })
+	// Mirrored: the writer first updates Source rows (touch path), then its Delta rows.
+	t.Run("mirrored", func(t *testing.T) { uncommittedReadersDuringWrites(t, core.Mirrored) })
+}
+
+func uncommittedReadersDuringWrites(t *testing.T, kind core.TableKind) {
+	srcRows := 0
+	if kind == core.Mirrored {
+		srcRows = 300
+	}
+	e := newUniqEnv(t, kind, srcRows)
 	w := e.session(1)
 	stmt(t, w, core.PerTransaction)
 	var wg sync.WaitGroup
@@ -285,9 +295,15 @@ func TestUncommittedReadersDuringWrites(t *testing.T) {
 		}(100000 * (r + 1))
 	}
 	for i := 1; i <= 300; i++ {
-		res, err := w.Insert(e.acct, []core.Row{arow(i, 1000+i, 5000+i)}, [][]core.KeyImage{aimg(i, 1000+i, 5000+i)})
-		if err != nil || res[0].Err != nil {
-			t.Fatalf("insert %d: %v %+v", i, err, res)
+		if kind == core.Mirrored {
+			if err := w.Update(e.acct, srcRef(i), arow(i, 1500+i, 5000+i), aimg(i, 1500+i, 5000+i)); err != nil {
+				t.Fatalf("source update %d: %v", i, err)
+			}
+		} else {
+			res, err := w.Insert(e.acct, []core.Row{arow(i, 1000+i, 5000+i)}, [][]core.KeyImage{aimg(i, 1000+i, 5000+i)})
+			if err != nil || res[0].Err != nil {
+				t.Fatalf("insert %d: %v %+v", i, err, res)
+			}
 		}
 		ref := core.RowRef{Origin: core.OriginDelta, PK: core.Key{Image: img(i)}}
 		if err := w.Update(e.acct, ref, arow(i, 2000+i, 5000+i), aimg(i, 2000+i, 5000+i)); err != nil {
