@@ -246,7 +246,9 @@ type SourceCursor interface {
 }
 
 // SourceRows is a batch of Source rows. Keys holds the identity key bytes of
-// each row; KeyIdx, for lookups, which requested key each row answers.
+// each row; KeyIdx, for lookups, which requested key each row answers. Rows
+// are valid for the batch: an engine may share one allocation between them,
+// so anything that keeps a row longer must copy it.
 type SourceRows struct {
 	Rows   []Row
 	Keys   []SourceKey
